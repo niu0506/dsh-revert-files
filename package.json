@@ -1,0 +1,25 @@
+{
+  "name": "@local/revert-files",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Restores the worktree and the conversation to their state before an Agent turn, from Git snapshots taken at the start of every turn, from the user message row, the change review tab, the /revert command, and the revert_files tool.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "scripts": {
+    "test": "node test/client.test.mjs && node test/host.test.mjs"
+  },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-chat", "@deepseek-ai/dsh-client-ui-deliverables", "@deepseek-ai/dsh-client-ui-context-menu"]
+    }
+  }
+}

@@ -1,0 +1,3 @@
+- insert:
+    - id: revert-files
+      name: '@local/revert-files'
