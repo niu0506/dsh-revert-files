@@ -93,10 +93,10 @@ const subprocess = {
  * 下面每个测试夹具都通过它驱动 `apply()` 的 `ctx` 缝隙：按名称取服务、
  * 捕获的处理器与注册项，以及一个警告会被断言而非忽略的日志器——否则
  * 被吞掉的快照失败只会表现为超时。
- * @param {{sessionId: string, session: any, services?: Record<string, any>, seam?: any}} options - 会话、任何额外服务，以及可选的 subprocess 缝隙。
- * @returns {{ctx: any, handlers: Map<string, any>, tools: any[], commands: any[], warnings: string[]}} 该缝隙。
+ * @param {{sessionId: string, session: any, services?: Record<string, any>, seam?: any, cordis?: any}} options - 会话、任何额外服务、可选的 subprocess 缝隙，以及可选的 `ctx.parallel`/`ctx.registry`（强制删除要用的宿主边界）。
+ * @returns {{ctx: any, handlers: Map<string, any>, tools: any[], commands: any[], warnings: string[], emitted: any[]}} 该缝隙。
  */
-const makeContext = ({ sessionId, session, services = {}, seam = subprocess }) => {
+const makeContext = ({ sessionId, session, services = {}, seam = subprocess, cordis = {} }) => {
   const handlers = new Map();
   const tools = [];
   const commands = [];
@@ -105,7 +105,7 @@ const makeContext = ({ sessionId, session, services = {}, seam = subprocess }) =
   const ctx = {
     get(name) {
       if (name === 'subprocess') return seam;
-      if (name === 'sessions') return { get: (id) => (id === sessionId ? session : undefined) };
+      if (name === 'sessions') return services.sessions ?? { get: (id) => (id === sessionId ? session : undefined) };
       return services[name];
     },
     on(name, handler) {
@@ -119,8 +119,25 @@ const makeContext = ({ sessionId, session, services = {}, seam = subprocess }) =
       resolve: async (target) => target,
       deleteFile: async () => {},
     },
+    ...(cordis.parallel === undefined ? {} : { parallel: cordis.parallel }),
+    ...(cordis.registry === undefined ? {} : { registry: cordis.registry }),
   };
   return { ctx, handlers, tools, commands, warnings, emitted };
+};
+
+/**
+ * 一个假的 Cordis 插件注册表，只提供强制删除读取的那一处：
+ * `ctx.registry.values()` 里的每个 fiber 的 `_disposables`，其中
+ * 标注为 `agentLoop.lifecycle(<id>)` 的那一个就是会话写句柄的生命周期。
+ * @param {string} sessionId - 该生命周期所属的会话。
+ * @param {() => void|Promise<void>} cleanup - 卸载时运行的清理。
+ * @param {boolean} [labelIt] - 是否带上宿主真正使用的 effect 标签。
+ * @returns {{values: () => Iterable<any>}} 注册表缝隙。
+ */
+const fakeRegistry = (sessionId, cleanup, labelIt = true) => {
+  const effect = () => cleanup();
+  if (labelIt) effect[Symbol.for('cordis.effect')] = { label: `agentLoop.lifecycle(${sessionId})`, children: [] };
+  return { values: () => [{ fibers: [{ _disposables: [effect] }] }] };
 };
 
 /**
@@ -875,6 +892,109 @@ const residentRun = await residentHandler({ agent: { id: carrierId }, rawInput: 
 check('executing against a resident Session fails', residentRun.kind === 'error', residentRun.text);
 check('a refused deletion leaves the artifacts alone', fs.existsSync(targetLog) && fs.existsSync(targetCheckpoint));
 
+// 驻留会话 + 找得到的生命周期边界：`--force` 先卸载，再删。
+// 卸载必须真的关掉写句柄，否则删除会报"没能卸载"而不是假装成功。
+const forcedId = 'session-forced';
+const forcedDir = path.join(deleteHome, 'sessions', '--work--', forcedId);
+fs.mkdirSync(forcedDir, { recursive: true });
+const forcedLog = path.join(forcedDir, 'session.v4.jsonl.zstd');
+fs.writeFileSync(forcedLog, 'forced bytes');
+fs.writeFileSync(path.join(forcedDir, 'session.lock'), '');
+let forcedResident = true;
+let forcedCleanups = 0;
+let forcedStops = 0;
+const forcedServices = () => ({
+  ...deletedServices(),
+  sessionPersistence: {
+    root: path.join(deleteHome, 'sessions'),
+    stat: async (id) =>
+      id === forcedId
+        ? { header: { id, cwd: '/work' }, sizeBytes: 12, location: { kind: 'jsonl', path: forcedLog } }
+        : undefined,
+  },
+  sessions: { get: (id) => (id === forcedId && forcedResident ? {} : undefined) },
+  agents: { get: (id) => (id === forcedId && forcedResident ? {
+    cancel: () => {},
+    whenIdle: async () => {},
+  } : undefined) },
+});
+const forcedSeam = makeContext({
+  sessionId: carrierId,
+  session: {},
+  services: forcedServices(),
+  cordis: {
+    parallel: async (name) => {
+      if (name === 'workspace/session-stop') forcedStops += 1;
+    },
+    // 清理器关掉"写句柄"：此后会话就不再驻留。
+    registry: fakeRegistry(forcedId, () => {
+      forcedCleanups += 1;
+      forcedResident = false;
+    }),
+  },
+});
+apply(forcedSeam.ctx);
+const forcedHandler = forcedSeam.commands.find((definition) => definition.name === DELETE_COMMAND)?.handler;
+const plainForcedPlan = await forcedHandler({ agent: { id: carrierId }, rawInput: `--id ${forcedId} --plan` });
+check(
+  'a resident Session suggests --force instead of only refusing',
+  plainForcedPlan.kind === 'error' && plainForcedPlan.text.includes('--force'),
+  plainForcedPlan.text,
+);
+const forcedPlan = await forcedHandler({ agent: { id: carrierId }, rawInput: `--id ${forcedId} --plan --force` });
+check(
+  'a forced plan is confirmable and explains the eviction',
+  forcedPlan.kind === 'success' && forcedPlan.text.includes('卸载'),
+  forcedPlan.text,
+);
+check('a forced plan evicts nothing yet', forcedCleanups === 0 && fs.existsSync(forcedLog));
+const forcedRun = await forcedHandler({ agent: { id: carrierId }, rawInput: `--id ${forcedId}` });
+check(
+  'deleting a resident Session still needs --force',
+  forcedRun.kind === 'error' && forcedRun.text.includes('--force'),
+  forcedRun.text,
+);
+check('the refused forced-less deletion evicted nothing', forcedCleanups === 0 && fs.existsSync(forcedLog));
+const forcedDone = await forcedHandler({ agent: { id: carrierId }, rawInput: `--id ${forcedId} --force` });
+check('a forced deletion reports success', forcedDone.kind === 'success', forcedDone.text);
+check('a forced deletion stops the Session work first', forcedStops >= 1, String(forcedStops));
+check('a forced deletion runs the lifecycle cleanup', forcedCleanups === 1, String(forcedCleanups));
+check('a forced deletion removes the directory', !fs.existsSync(forcedDir), forcedDone.text);
+
+// 驻留但找不到生命周期边界：拒绝并说明只能重启，绝不猜测着删。
+const opaqueId = 'session-opaque';
+const opaqueDir = path.join(deleteHome, 'sessions', '--work--', opaqueId);
+fs.mkdirSync(opaqueDir, { recursive: true });
+const opaqueLog = path.join(opaqueDir, 'session.v4.jsonl.zstd');
+fs.writeFileSync(opaqueLog, 'opaque');
+const opaqueSeam = makeContext({
+  sessionId: carrierId,
+  session: {},
+  services: {
+    ...deletedServices(),
+    sessionPersistence: {
+      root: path.join(deleteHome, 'sessions'),
+      stat: async (id) =>
+        id === opaqueId
+          ? { header: { id, cwd: '/work' }, location: { kind: 'jsonl', path: opaqueLog } }
+          : undefined,
+    },
+    sessions: { get: (id) => (id === opaqueId ? {} : undefined) },
+  },
+  // 标签对不上：宿主换了名字，插件不能靠猜去卸载。
+  cordis: { parallel: async () => {}, registry: fakeRegistry(opaqueId, () => {}, false) },
+});
+apply(opaqueSeam.ctx);
+const opaqueHandler = opaqueSeam.commands.find((definition) => definition.name === DELETE_COMMAND)?.handler;
+const opaquePlan = await opaqueHandler({ agent: { id: carrierId }, rawInput: `--id ${opaqueId} --plan --force` });
+check(
+  'an unlabelled lifecycle cannot be force-deleted',
+  opaquePlan.kind === 'error' && opaquePlan.text.includes('生命周期'),
+  opaquePlan.text,
+);
+const opaqueRun = await opaqueHandler({ agent: { id: carrierId }, rawInput: `--id ${opaqueId} --force` });
+check('an unlabelled lifecycle leaves the log alone', opaqueRun.kind === 'error' && fs.existsSync(opaqueLog), opaqueRun.text);
+
 const deleted = await deleteHandler({ agent: { id: carrierId }, rawInput: `--id ${targetId}` });
 check('deleting reports success', deleted.kind === 'success', deleted.text);
 check('deleting removes the Session directory', !fs.existsSync(targetDir));
@@ -1373,6 +1493,152 @@ for (const [label, value] of Object.entries(refusedTurns)) {
   );
 }
 check('the tool still exposes list/plan/revert', typeof revertTool?.execute === 'function');
+
+// --- 名字里带 glob 元字符的文件 ---------------------------------
+// `git ls-files -- <path>` 默认把路径解释成 glob：`dir/foo[1].txt` 会
+// 连同 `dir/foo1.txt` 一起匹配，而 git 按路径排序，`foo1.txt` 排在
+// 前面。取第一个匹配项就会操作错误的路径 —— 轻则恢复了一个无关文件，
+// 重则把用户要撤回的文件当成"新增"删掉。
+const globNameOnce = async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-revert-glob-'));
+  const sessionId = 'session-glob-test';
+  git(['init', '-q'], repo);
+  fs.mkdirSync(path.join(repo, 'dir'));
+  // 目标：名字里带方括号。快照里有它。
+  fs.writeFileSync(path.join(repo, 'dir', 'foo[1].txt'), 'target\n');
+  // 兄弟：同一个 glob 也会匹配到它，而且它在排序里更靠前。
+  fs.writeFileSync(path.join(repo, 'dir', 'foo1.txt'), 'sibling\n');
+  git(['add', '-A'], repo);
+  git(['commit', '-qm', 'init'], repo);
+
+  /** @type {any[]} */
+  const log = [];
+  const session = {
+    id: sessionId,
+    header: { cwd: repo },
+    surface: { nodes: [] },
+    eventAt: (seq) => log[seq],
+    snapshotEvents: () => log,
+    append() {
+      throw new Error('a single-file revert never touches the conversation');
+    },
+  };
+  const SEQ = 5;
+  const summary = {
+    turn: 1,
+    cwd: repo,
+    files: [
+      { path: 'dir/foo[1].txt', display: 'dir/foo[1].txt' },
+      { path: 'dir/bar[2].txt', display: 'dir/bar[2].txt' },
+    ],
+  };
+  const { ctx, handlers, commands, warnings } = makeContext({
+    sessionId,
+    session,
+    services: { workspaceChanges: { summary: (id, seq) => (id === sessionId && seq === SEQ ? summary : undefined) } },
+  });
+  apply(ctx);
+
+  const opened = { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } };
+  log[0] = opened;
+  handlers.get('session/event')(session, opened);
+  await waitForTurnRef(repo, 1, warnings);
+
+  // 快照之后才出现的兄弟：glob 会匹配到它，而它不在快照里 ——
+  // 旧的行为会把用户的目标当成"新增"删掉。
+  fs.writeFileSync(path.join(repo, 'dir', 'bar2.txt'), 'late sibling\n');
+  fs.writeFileSync(path.join(repo, 'dir', 'foo[1].txt'), 'target changed\n');
+  fs.writeFileSync(path.join(repo, 'dir', 'foo1.txt'), 'sibling changed\n');
+  fs.writeFileSync(path.join(repo, 'dir', 'bar[2].txt'), 'target changed\n');
+
+  const handler = commands.find((definition) => definition.name === COMMAND)?.handler;
+  const asAgent = (rawInput) => handler({ agent: { id: sessionId }, rawInput });
+  const plan = await asAgent(`--seq ${SEQ} --index 0 --plan`);
+  const applied = await asAgent(`--seq ${SEQ} --index 0`);
+  const target = fs.readFileSync(path.join(repo, 'dir', 'foo[1].txt'), 'utf8');
+  const sibling = fs.readFileSync(path.join(repo, 'dir', 'foo1.txt'), 'utf8');
+
+  const latePlan = await asAgent(`--seq ${SEQ} --index 1 --plan`);
+  const lateApplied = await asAgent(`--seq ${SEQ} --index 1`);
+  const lateTarget = fs.existsSync(path.join(repo, 'dir', 'bar[2].txt'))
+    ? fs.readFileSync(path.join(repo, 'dir', 'bar[2].txt'), 'utf8')
+    : '(deleted)';
+  const lateSibling = fs.existsSync(path.join(repo, 'dir', 'bar2.txt'))
+    ? fs.readFileSync(path.join(repo, 'dir', 'bar2.txt'), 'utf8')
+    : '(deleted)';
+
+  fs.rmSync(repo, { recursive: true, force: true });
+  return { plan, applied, target, sibling, latePlan, lateApplied, lateTarget, lateSibling, warnings };
+};
+
+await harness('the glob-name harness', globNameOnce, (glob) => {
+  check('a glob-like name is planned as a restore', glob.plan?.kind === 'success', JSON.stringify(glob.plan));
+  check(
+    'the plan names the requested file',
+    String(glob.plan?.text ?? '').includes('foo[1].txt'),
+    String(glob.plan?.text),
+  );
+  check('the glob-name revert reports success', glob.applied?.kind === 'success', JSON.stringify(glob.applied));
+  check('the requested file is the one restored', glob.target === 'target\n', JSON.stringify(glob.target));
+  check('the sibling that shares the glob is left alone', glob.sibling === 'sibling changed\n', JSON.stringify(glob.sibling));
+  check('a sibling created after the snapshot does not swallow the target', glob.lateTarget === 'target changed\n', JSON.stringify(glob.lateTarget));
+  check('the late sibling is left alone', glob.lateSibling === 'late sibling\n', JSON.stringify(glob.lateSibling));
+  check('the glob-name harness logged no snapshot warning', glob.warnings.length === 0, JSON.stringify(glob.warnings));
+});
+
+// --- 含 `..` 的会话 id ------------------------------------------
+// Git 拒绝含 `..` 的 ref 名（`fatal: refusing to update ref with bad
+// name`）。旧版本把 id 原样放进可读部分，于是这样的会话每轮的快照
+// 都会失败 —— 那个会话从此没有任何可回退的前像。
+const dottedIdOnce = async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-revert-dots-'));
+  const sessionId = 'session..dotted';
+  git(['init', '-q'], repo);
+  const file = path.join(repo, 'f.txt');
+  fs.writeFileSync(file, 'v0\n');
+  git(['add', '-A'], repo);
+  git(['commit', '-qm', 'init'], repo);
+
+  /** @type {any[]} */
+  const log = [];
+  let seq = 0;
+  const session = {
+    id: sessionId,
+    header: { cwd: repo },
+    surface: { nodes: [] },
+    eventAt: (at) => log[at],
+    snapshotEvents: () => log,
+    append(type, data, opts) {
+      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
+      log.push(event);
+      return event;
+    },
+  };
+  const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
+  apply(ctx);
+  const asAgent = (rawInput) =>
+    commands.find((definition) => definition.name === COMMAND)?.handler({ agent: { id: sessionId }, rawInput });
+  const emit = (event) => {
+    log.push(event);
+    handlers.get('session/event')(session, event);
+  };
+
+  emit({ type: 'turn/start', seq: (seq += 1), time: 0, data: { turn: 1 } });
+  await waitForTurnRef(repo, 1, warnings);
+  fs.writeFileSync(file, 'v1\n');
+  emit({ type: 'turn/end', seq: (seq += 1), time: 0, data: { turn: 1, reason: { kind: 'completed' } } });
+
+  const reverted = await asAgent('--turn 1');
+  const after = fs.readFileSync(file, 'utf8');
+  fs.rmSync(repo, { recursive: true, force: true });
+  return { reverted, after, warnings };
+};
+
+await harness('the dotted-id harness', dottedIdOnce, (dotted) => {
+  check('a Session id with dots still gets a snapshot', dotted.warnings.length === 0, JSON.stringify(dotted.warnings));
+  check('a Session id with dots still reverts', dotted.after === 'v0\n', JSON.stringify(dotted.after));
+  check('the dotted-id revert reports success', dotted.reverted?.kind === 'success', JSON.stringify(dotted.reverted));
+});
 
 for (const line of results) console.log(line);
 

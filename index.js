@@ -98,6 +98,16 @@ const MAX_HIDDEN_TURNS = 1000;
 /** @param {unknown} value @returns {value is Record<string, unknown>} */
 const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 
+/**
+ * 一个正的、安全整数的轮次。
+ *
+ * 轮次判定在好几处出现：会话事件、命令解析、快照解析。它们问的是
+ * 同一个问题，所以答案也该只有一份。
+ * @param {unknown} value - 候选轮次。
+ * @returns {boolean} 它是大于 0 的安全整数时为 true。
+ */
+const isPositiveTurn = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+
 /** @param {unknown} error @returns {string} */
 const errorCode = (error) => {
   if (isRecord(error)) {
@@ -122,10 +132,20 @@ const firstLine = (text) =>
  * 整个 id 的摘要。这个摘要很重要 —— 把非 ref 字符清理掉会
  * 把不同的 id（`a/b` 和 `a_b`）映射到同一个命名空间，这会让两个
  * 会话共享同一个快照命名空间和同一个私有索引文件。
+ *
+ * 可读部分必须始终是一个合法的 ref 组件：Git 拒绝含 `..` 的名字，
+ * 所以 `..` 连写会被折成一个下划线。少了这一步，一个含有 `..` 的
+ * 会话 id 会让 `update-ref` 每次都失败 —— 那个会话的所有轮次都拿不到
+ * 快照，只留下一行警告。
  */
 const refPart = (value) => {
   const id = String(value);
-  const readable = id.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[.-]+/, '').slice(0, 24);
+  const readable = id
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .replace(/\.{2,}/g, '_')
+    .replace(/^[.-]+/, '')
+    .slice(0, 24)
+    .replace(/\.+$/, '');
   const digest = crypto.createHash('sha1').update(id).digest('hex').slice(0, 16);
   return `${readable === '' ? 'session' : readable}-${digest}`;
 };
@@ -133,11 +153,23 @@ const refPart = (value) => {
 /**
  * 摘要化之前的组件名。更早的版本固定在其下的快照
  * 仍然可读，因此重新打开的会话不会悄悄丢失它的历史。
+ *
+ * 只有当 id 本身就是安全路径段时才会用它：旧命名把非 ref 字符换成
+ * 下划线，于是 `a/b` 与 `a_b` 落在同一个旧命名空间里 —— 读别人的
+ * 快照会让回退作用在错误的仓库状态上。当前命名带摘要，没有这个问题；
+ * 这个回退只服务"id 本身就是安全段"的会话，也正是 DSH 实际产生的那种。
  */
 const legacyRefPart = (value) => {
   const cleaned = String(value).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[.-]+/, '');
   return cleaned === '' ? 'session' : cleaned;
 };
+
+/**
+ * 某个会话是否有一个无歧义的旧命名空间。
+ * @param {string} sessionId - 会话 id。
+ * @returns {boolean} 旧命名空间只可能属于这个会话时为 true。
+ */
+const hasUnambiguousLegacyName = (sessionId) => legacyRefPart(sessionId) === String(sessionId);
 
 /**
  * 把一个会话 id 编码成 JSONL 持久化后端据以推导其会话目录的
@@ -410,8 +442,9 @@ export function apply(ctx) {
   /** @returns {string} 某一轮已固定的快照 ref。 */
   const refFor = (sessionId, turn) => `${REF_ROOT}/${refPart(sessionId)}/turn-${turn}`;
 
-  /** @returns {string} 摘要化之前组件名下的同一个 ref。 */
-  const legacyRefFor = (sessionId, turn) => `${REF_ROOT}/${legacyRefPart(sessionId)}/turn-${turn}`;
+  /** @returns {string|undefined} 摘要化之前组件名下的同一个 ref；旧命名有歧义时为 undefined。 */
+  const legacyRefFor = (sessionId, turn) =>
+    hasUnambiguousLegacyName(sessionId) ? `${REF_ROOT}/${legacyRefPart(sessionId)}/turn-${turn}` : undefined;
 
   /**
    * 回退前落下的反悔点。它与 `turn-…` 分开命名，因此绝不会被
@@ -488,6 +521,7 @@ export function apply(ctx) {
     const repo = await repoFor(sessionId);
     const generation = stateFor(sessionId).repoGeneration;
     for (const ref of [refFor(sessionId, turn), legacyRefFor(sessionId, turn)]) {
+      if (ref === undefined) continue;
       const result = await runGit(sessionId, ['rev-parse', '--verify', '--quiet', `${ref}^{tree}`], { cwd: repo.root });
       if (result.code !== 0) continue;
       const sha = result.stdout.trim();
@@ -505,7 +539,11 @@ export function apply(ctx) {
     // 每个命名空间一次有界查询：ref 从不被剪除，所以列出整个
     // `REF_ROOT` 会随着每个曾在此运行过的会话增长。
     const turns = new Set();
-    for (const prefix of [`${REF_ROOT}/${refPart(sessionId)}/`, `${REF_ROOT}/${legacyRefPart(sessionId)}/`]) {
+    const prefixes = [`${REF_ROOT}/${refPart(sessionId)}/`];
+    // 旧命名空间只有在没有歧义时才查：它不带摘要，两个只差在非 ref
+    // 字符上的会话会共用它。
+    if (hasUnambiguousLegacyName(sessionId)) prefixes.push(`${REF_ROOT}/${legacyRefPart(sessionId)}/`);
+    for (const prefix of prefixes) {
       const result = await runGit(sessionId, ['for-each-ref', '--format=%(refname)', prefix], { cwd: repo.root });
       if (result.code !== 0) continue;
       for (const line of result.stdout.split(/\r?\n/)) {
@@ -528,7 +566,7 @@ export function apply(ctx) {
    * **两个**路径（`R100\0old\0new\0`），其余状态只带一个 —— 记录长度
    * 必须跟着状态走，按固定二元组配对会把之后每一条记录都读错。
    * @param {string} stdout - NUL 分隔的输出。
-   * @returns {Array<{status: string, path: string, from?: string, to?: string}>} 解析后的记录。
+   * @returns {Array<{status: string, path: string, from?: string}>} 解析后的记录。
    */
   const parseNameStatus = (stdout) => {
     const fields = stdout.split('\u0000');
@@ -545,7 +583,7 @@ export function apply(ctx) {
         const from = fields[index + 1];
         const to = fields[index + 2];
         if (from === undefined || to === undefined || from === '' || to === '') break;
-        entries.push({ status: letter, path: to, from, to });
+        entries.push({ status: letter, path: to, from });
         index += 3;
       } else {
         const file = fields[index + 1];
@@ -600,7 +638,7 @@ export function apply(ctx) {
     });
     if (result.code !== 0) return undefined;
     for (const entry of parseNameStatus(result.stdout)) {
-      if (entry.status === 'R' && entry.to === relPath) return entry.from;
+      if (entry.status === 'R' && entry.path === relPath) return entry.from;
     }
     return undefined;
   };
@@ -653,13 +691,6 @@ export function apply(ctx) {
     // 都会被写回，而该轮新建的路径会被删除。
     await gitOk(sessionId, ['read-tree', '--reset', '-u', tree], { cwd: repo.root, env });
     return { changed, repo, undo };
-  };
-
-  /** 把整个工作区恢复到某一轮开始前的快照。 */
-  const restoreWorktree = async (sessionId, turn) => {
-    const tree = await snapshotFor(sessionId, turn);
-    if (tree === undefined) return { error: 'no-snapshot' };
-    return restoreTree(sessionId, tree);
   };
 
   /**
@@ -879,7 +910,7 @@ export function apply(ctx) {
     if (typeof sessionId !== 'string' || sessionId === '') return;
     const state = stateFor(sessionId);
     const turn = event?.data?.turn;
-    const validTurn = typeof turn === 'number' && Number.isSafeInteger(turn) && turn > 0;
+    const validTurn = isPositiveTurn(turn);
     if (validTurn) {
       if (turn > state.turn) state.turn = turn;
       if (event.type === 'turn/start' && typeof event.seq === 'number') state.turnStarts.set(turn, event.seq);
@@ -900,7 +931,7 @@ export function apply(ctx) {
     // 和每个缓存的树都属于它刚刚离开的检出。
     if (event?.type === 'working-directory/change') forgetRepoState(state);
     if (event?.type !== 'turn/start') return;
-    if (typeof turn !== 'number' || !Number.isSafeInteger(turn) || turn <= 0) return;
+    if (!validTurn) return;
     // 轮次的前像必须在该轮写入任何内容之前存在；
     // 失败只上报一次，绝不干扰该轮。
     ensureSnapshot(sessionId, turn).catch((error) => {
@@ -935,9 +966,16 @@ export function apply(ctx) {
     return typeof next === 'function' ? next() : undefined;
   };
 
-  ctx.on('fs/write-intent', handleFileIntent);
-  ctx.on('fs/edit-intent', handleFileIntent);
-  ctx.on('fs/delete-intent', handleFileIntent);
+  // 这三个槽位必须用 `prepend` 注册，也就是做最外层的那一个。
+  //
+  // Cordis 的 waterfall 是"不调用 `next()` 的监听器否决整条链"：
+  // `dsh-fs-observation-policy` 刻意不调用 `next()`（它自己就是新鲜度
+  // 守卫），所以一旦它先注册，本插件的监听器根本不会执行 —— 快照还没
+  // 落盘，写入就已经发生了。做成最外层就不受注册顺序影响：本插件
+  // 等完快照再把槽位交还，最终的决定权仍然在上游手里。
+  ctx.on('fs/write-intent', handleFileIntent, { prepend: true });
+  ctx.on('fs/edit-intent', handleFileIntent, { prepend: true });
+  ctx.on('fs/delete-intent', handleFileIntent, { prepend: true });
 
   ctx.on('session/disposed', (session) => {
     const sessionId = session?.id;
@@ -967,6 +1005,31 @@ export function apply(ctx) {
   // 调用方
   // ---------------------------------------------------------------------------
 
+  /**
+   * 解析出来的仓库相对路径是否就是被请求的那一个。
+   *
+   * `ls-files --full-name` 输出的是相对仓库根的路径，而 `file.path`
+   * 相对会话工作目录 —— 工作目录可能是仓库的子目录，所以仓库相对路径
+   * 是 `file.path` 的后缀。反过来，记录器也可能给出工作目录之外的
+   * **绝对**路径，这时仓库相对路径是那条绝对路径的后缀。
+   * Git 的输出永远用 `/`，所以比较之前先统一分隔符。
+   *
+   * 这是字面量 pathspec 之外的一道保险：路径一旦被解释成 glob，
+   * 匹配到的可能是另一个文件，而那会让回退作用在错误的路径上。
+   * @param {string} relPath - 仓库相对路径。
+   * @param {string} requested - 被请求的路径。
+   * @returns {boolean} 两者指向同一个路径时为 true。
+   */
+  const isRequestedPath = (relPath, requested) => {
+    const slash = (value) => String(value).replace(/\\/g, '/').replace(/^\.\//, '');
+    const target = slash(requested);
+    const found = slash(relPath);
+    if (target === '' || found === '') return false;
+    if (found === target) return true;
+    if (path.isAbsolute(String(requested))) return target.endsWith(`/${found}`);
+    return found.endsWith(`/${target}`);
+  };
+
   /** 把一个 `workspace/changes` 条目解析成其仓库相对路径和轮次。 */
   const targetFromCoordinates = async (sessionId, seq, index) => {
     const changes = ctx.get('workspaceChanges');
@@ -979,10 +1042,16 @@ export function apply(ctx) {
     // Git 针对自己的工作目录解析路径，因此通过符号链接抵达的
     // 工作区（`/var` 与 `/private/var`）仍然能得到
     // `read-tree` 和 `checkout-index` 所使用的仓库相对名称。
+    //
+    // `GIT_LITERAL_PATHSPECS=1` 是必需的：路径里出现 `[`、`]`、`*`、
+    // `?` 时，默认的 pathspec 语义会把它当成 glob，于是
+    // `dir/foo[1].txt` 会连同 `dir/foo1.txt` 一起匹配。取第一个匹配项
+    // 就会操作错误的路径 —— 轻则恢复了一个无关文件，重则把用户要撤回的
+    // 文件删掉。字面量语义下每个路径只匹配它自己。
     const listed = await runGit(
       sessionId,
       ['ls-files', '--full-name', '-z', '--cached', '--others', '--exclude-standard', '--', file.path],
-      { cwd },
+      { cwd, env: { GIT_LITERAL_PATHSPECS: '1' } },
     );
     if (listed.code !== 0) {
       // 这里常见的失败是记录器捕获到了仓库之外的路径
@@ -992,6 +1061,10 @@ export function apply(ctx) {
     }
     const relPath = listed.stdout.split('\u0000').find((entry) => entry !== '');
     if (relPath === undefined) return { error: 'not-tracked-by-git' };
+    // 解析出来的仓库相对路径必须就是被请求的那一个。cwd 可能是仓库的
+    // 子目录，所以仓库相对路径是 `file.path` 的后缀；不是的话，
+    // 说明路径解析到了别的东西，宁可拒绝也不动错的文件。
+    if (!isRequestedPath(relPath, file.path)) return { error: 'not-tracked-by-git' };
     const target = await ctx.fs.resolve(path.resolve(cwd, file.path));
     return {
       turn: summary.turn,
@@ -1006,6 +1079,27 @@ export function apply(ctx) {
 
   /** 每个调用方传入的都是已校验的正数轮次。 */
   const describeTurn = (turn) => `第 ${turn} 轮`;
+
+  /** 某一轮没有快照时的报告；预览与执行说的是同一句话。 */
+  const noSnapshotMessage = (turn) => `第 ${describeTurn(turn)}没有可用的快照，无法回退。`;
+
+  /** 这个会话一个快照都没有时的报告。 */
+  const NO_SNAPSHOT_MESSAGE =
+    '没有可用的快照。快照在每一轮开始时建立，只有文件工具之外、由 shell 命令造成的改动也包含在其中。';
+
+  /**
+   * 解析一次请求的目标轮次：请求里指定的轮次、当前轮，或者最后一个
+   * 有快照的轮次。预览与执行用的是同一套判断，所以它们说的是同一件事。
+   * @param {string} sessionId - 所属会话。
+   * @param {unknown} requested - 请求里指定的轮次；没有则用当前轮。
+   * @returns {Promise<number|undefined>} 目标轮次；这个会话一个快照都没有时为 undefined。
+   */
+  const resolveTurn = async (sessionId, requested) => {
+    const state = stateFor(sessionId);
+    const wanted = isPositiveTurn(requested) ? requested : state.turn > 0 ? state.turn : undefined;
+    if (wanted !== undefined) return wanted;
+    return (await snapshotTurns(sessionId)).at(-1);
+  };
 
   /** 针对无法解析的坐标给出的一份可读报告。 */
   const describeLocateError = (code) => {
@@ -1030,21 +1124,19 @@ export function apply(ctx) {
    * @param {string} sessionId - 所属会话。
    * @param {number} seq - 其记录列出该文件的事件的 seq。
    * @param {number} index - 该文件在那条记录中的下标。
-   * @returns {Promise<{turn: number, relPath: string, displayPath: string, target: string, tree: string, sourceRelPath: string|undefined}|{error: string}>}
+   * @returns {Promise<{turn: number, relPath: string, displayPath: string, target: string, tree: string, presentInTree: boolean, sourceRelPath: string|undefined}|{error: string}>}
    *   目标；或者 `error`，其中是一份可直接返回的报告。
    */
   const locateFile = async (sessionId, seq, index) => {
     const located = await targetFromCoordinates(sessionId, seq, index);
     if (located.error !== undefined) return { error: describeLocateError(located.error) };
     const turn = located.turn;
-    if (!Number.isSafeInteger(turn) || turn <= 0) {
+    if (!isPositiveTurn(turn)) {
       return { error: '该文件所属的轮次未知，无法回退。' };
     }
     const tree = await snapshotFor(sessionId, turn);
     if (tree === undefined) {
-      return {
-        error: `第 ${turn} 轮没有可用的快照，无法回退。`,
-      };
+      return { error: noSnapshotMessage(turn) };
     }
     // 快照里没有这个路径时，它可能是一次重命名的目的地：这一轮的
     // 语义是"把旧路径挪到这里"，所以单文件回退既要写回原文件，
@@ -1060,6 +1152,9 @@ export function apply(ctx) {
       displayPath: located.displayPath,
       target: located.target,
       tree,
+      // 这个路径在快照里是否存在：预览与恢复都要用这个判断，
+      // 所以在这里问一次就够，不必各自再跑一遍 git。
+      presentInTree: present.code === 0,
       sourceRelPath,
     };
   };
@@ -1078,6 +1173,24 @@ export function apply(ctx) {
   };
 
   /**
+   * 一个改动路径在报告里的动作词。
+   *
+   * 词表只有一份：预览说"将被如何"，执行说"已经如何"，两套措辞
+   * 都要用同一批词，拼错一个字就会让报告与实际动作对不上。
+   * @param {'A'|'D'|'M'} status - Git 的分类：新增、删除、修改。
+   * @param {'plan'|'done'} mode - 该改动是否仍然待处理。
+   * @returns {string} 动作词。
+   */
+  const actionLabel = (status, mode) => {
+    if (mode === 'plan') {
+      if (status === 'A') return '新增，将删除';
+      if (status === 'D') return '已删除，将还原';
+      return '已修改，将写回原文';
+    }
+    return status === 'A' ? '已删除' : '已写回原文';
+  };
+
+  /**
    * 每个改动路径一行 `  path（动作）`，并设上限以让大轮次保持可读。
    * @param {Array<{status: string, path: string}>} changed - Git 分类的路径。
    * @param {'plan'|'done'} mode - 该改动是否仍然待处理。
@@ -1085,19 +1198,7 @@ export function apply(ctx) {
    */
   const describeFileLines = (changed, mode) => {
     const shown = changed.slice(0, MAX_LISTED_FILES);
-    const lines = shown.map((item) => {
-      const action =
-        mode === 'plan'
-          ? item.status === 'A'
-            ? '新增，将删除'
-            : item.status === 'D'
-              ? '已删除，将还原'
-              : '已修改，将写回原文'
-          : item.status === 'A'
-            ? '已删除'
-            : '已写回原文';
-      return `  ${item.path}（${action}）`;
-    });
+    const lines = shown.map((item) => `  ${item.path}（${actionLabel(item.status, mode)}）`);
     if (changed.length > shown.length) {
       const rest = changed.length - shown.length;
       lines.push(`  …另有 ${rest} 个文件未列出。`);
@@ -1128,48 +1229,36 @@ export function apply(ctx) {
     if (Number.isSafeInteger(request.seq) && Number.isSafeInteger(request.index)) {
       const located = await locateFile(sessionId, request.seq, request.index);
       if (located.error !== undefined) return { kind: 'error', text: located.error };
+      const header = `撤回这个文件会把它退回${describeTurn(located.turn)}开始前的内容：`;
       if (typeof located.sourceRelPath === 'string' && located.sourceRelPath !== '') {
         // 一次重命名：把来源写回原文，并删掉当前路径。
         return {
           kind: 'success',
           text: [
-            `撤回这个文件会把它退回${describeTurn(located.turn)}开始前的内容：`,
-            `  ${located.sourceRelPath}（已删除，将还原）`,
-            `  ${located.displayPath}（新增，将删除）`,
+            header,
+            `  ${located.sourceRelPath}（${actionLabel('D', 'plan')}）`,
+            `  ${located.displayPath}（${actionLabel('A', 'plan')}）`,
             '  这是一次重命名：回退会恢复原文件并删除当前路径。',
           ].join('\n'),
         };
       }
-      const repo = await repoFor(sessionId);
-      // 快照中没有的路径会被删除，而不是写回。
-      const present = await runGit(sessionId, ['cat-file', '-e', `${located.tree}:${located.relPath}`], { cwd: repo.root });
-      const action = present.code === 0 ? '已修改，将写回原文' : '新增，将删除';
+      // 快照中没有的路径会被删除，而不是写回 —— `locateFile` 已经
+      // 问过这件事了，不必再跑一遍 git。
+      const action = actionLabel(located.presentInTree ? 'M' : 'A', 'plan');
       return {
         kind: 'success',
-        text: [
-          `撤回这个文件会把它退回${describeTurn(located.turn)}开始前的内容：`,
-          `  ${located.displayPath}（${action}）`,
-        ].join('\n'),
+        text: [header, `  ${located.displayPath}（${action}）`].join('\n'),
       };
     }
 
-    const state = stateFor(sessionId);
-    const wanted = Number.isSafeInteger(request.turn) && request.turn > 0 ? request.turn : state.turn > 0 ? state.turn : undefined;
-    const turns = await snapshotTurns(sessionId);
-    const resolved = wanted ?? turns.at(-1);
+    const resolved = await resolveTurn(sessionId, request.turn);
     if (resolved === undefined) {
-      return {
-        kind: 'error',
-        text: '没有可用的快照。快照在每一轮开始时建立，只有文件工具之外、由 shell 命令造成的改动也包含在其中。',
-      };
+      return { kind: 'error', text: NO_SNAPSHOT_MESSAGE };
     }
     const repo = await repoFor(sessionId);
     const tree = await snapshotFor(sessionId, resolved);
     if (tree === undefined) {
-      return {
-        kind: 'error',
-        text: `第 ${resolved} 轮没有可用的快照，无法回退。`,
-      };
+      return { kind: 'error', text: noSnapshotMessage(resolved) };
     }
     const changed = await changedPaths(sessionId, repo, tree);
     const lines = [];
@@ -1229,32 +1318,53 @@ export function apply(ctx) {
     return lines.join('\n');
   };
 
-  const reportRestore = (turn, result, conversation) => {
-    const counts = describeCounts(result.changed);
-    const lines = [
-      `已把工作区恢复到${describeTurn(turn)}开始前的状态（仓库 ${result.repo.root}）。`,
-      `  ${counts}`,
-    ];
+  /**
+   * 一次恢复的报告正文：改动统计与逐个文件的行。
+   * 整轮回退与反悔点恢复说的是同一件事，所以正文只有一份。
+   * @param {object} result - `restoreTree` 的结果。
+   * @returns {string[]} 这些行。
+   */
+  const restoreReportBody = (result) => {
+    const lines = [`  ${describeCounts(result.changed)}`];
     if (result.changed.length > 0) lines.push(...describeFileLines(result.changed, 'done'));
+    return lines;
+  };
+
+  /**
+   * 一次恢复留下的反悔提示。
+   *
+   * 反悔点保存的是这次回退刚刚覆盖掉的状态 —— 它不是任何一轮的
+   * 前像，所以不能用 `--turn N+1` 去近似（那一轮之后的改动不在其中）。
+   * @param {number} undo - 反悔令牌。
+   * @param {boolean} rolledBack - 这一次是否连对话一起回滚了。
+   * @returns {string} 这一行。
+   */
+  const undoHint = (undo, rolledBack) =>
+    rolledBack
+      ? `  文件反悔：/revert --undo ${undo} 可以把文件恢复到这次回退之前，但对话回退无法撤销。`
+      : `  反悔：/revert --undo ${undo} 可以恢复到这次回退之前的状态。`;
+
+  const reportRestore = (turn, result, conversation) => {
+    const lines = [`已把工作区恢复到${describeTurn(turn)}开始前的状态（仓库 ${result.repo.root}）。`];
+    lines.push(...restoreReportBody(result));
     const conversationLine = reportConversation(conversation);
     if (conversationLine !== undefined) lines.push(`  ${conversationLine}`);
-    if (result.undo !== undefined) {
-      // 反悔点保存的是这次回退刚刚覆盖掉的状态 —— 它不是任何一轮的
-      // 前像，所以不能用 `--turn N+1` 去近似（那一轮之后的改动不在其中）。
-      const rolledBack = conversation?.kind === 'reverted';
-      lines.push(
-        rolledBack
-          ? `  文件反悔：/revert --undo ${result.undo} 可以把文件恢复到这次回退之前，但对话回退无法撤销。`
-          : `  反悔：/revert --undo ${result.undo} 可以恢复到这次回退之前的状态。`,
-      );
-    }
+    if (result.undo !== undefined) lines.push(undoHint(result.undo, conversation?.kind === 'reverted'));
     return lines.join('\n');
   };
 
   const reportPaths = (turn, result) => {
     const parts = [];
-    parts.push(`已从${describeTurn(turn)}的快照恢复 ${result.reverted.length} 个文件。`);
-    for (const item of result.reverted) parts.push(`  ${item.path}（${item.action === 'deleted' ? '已删除' : '已写回原文'}）`);
+    if (result.reverted.length === 0) {
+      // 一件都没恢复就不能用成功口径：那张卡片的确认按钮会带着
+      // "已完成"的报告，而工作区其实没有任何变化。
+      parts.push(`没有恢复任何文件：第 ${turn} 轮的快照里取不到它们的内容。`);
+    } else {
+      parts.push(`已从${describeTurn(turn)}的快照恢复 ${result.reverted.length} 个文件。`);
+      for (const item of result.reverted) {
+        parts.push(`  ${item.path}（${actionLabel(item.action === 'deleted' ? 'A' : 'M', 'done')}）`);
+      }
+    }
     if (result.skipped.length > 0) {
       parts.push(`跳过 ${result.skipped.length} 个文件：`);
       for (const item of result.skipped) parts.push(`  ${item.path}（${item.reason}）`);
@@ -1264,22 +1374,15 @@ export function apply(ctx) {
 
   /** 对某一轮、或对有快照的最新一轮做整个工作区的恢复。 */
   const runForTurn = async (sessionId, turn) => {
-    const state = stateFor(sessionId);
-    const wanted = Number.isSafeInteger(turn) && turn > 0 ? turn : state.turn > 0 ? state.turn : undefined;
-    const resolved = wanted ?? (await snapshotTurns(sessionId)).at(-1);
+    const resolved = await resolveTurn(sessionId, turn);
     if (resolved === undefined) {
-      return {
-        kind: 'error',
-        text: '没有可用的快照。快照在每一轮开始时建立，只有文件工具之外、由 shell 命令造成的改动也包含在其中。',
-      };
+      return { kind: 'error', text: NO_SNAPSHOT_MESSAGE };
     }
-    const result = await restoreWorktree(sessionId, resolved);
-    if (result.error !== undefined) {
-      return {
-        kind: 'error',
-        text: `第 ${resolved} 轮没有可用的快照，无法回退。`,
-      };
+    const tree = await snapshotFor(sessionId, resolved);
+    if (tree === undefined) {
+      return { kind: 'error', text: noSnapshotMessage(resolved) };
     }
+    const result = await restoreTree(sessionId, tree);
     const conversation = await revertConversation(sessionId, resolved);
     return { kind: 'success', text: reportRestore(resolved, result, conversation) };
   };
@@ -1291,14 +1394,9 @@ export function apply(ctx) {
       return { kind: 'error', text: `反悔点 ${token} 不存在或已被清理，没有恢复任何文件。` };
     }
     const result = await restoreTree(sessionId, tree);
-    const lines = [
-      `已把工作区恢复到反悔点 ${token} 记录的状态（仓库 ${result.repo.root}）。`,
-      `  ${describeCounts(result.changed)}`,
-    ];
-    if (result.changed.length > 0) lines.push(...describeFileLines(result.changed, 'done'));
-    if (result.undo !== undefined) {
-      lines.push(`  反悔：/revert --undo ${result.undo} 可以恢复到这次回退之前的状态。`);
-    }
+    const lines = [`已把工作区恢复到反悔点 ${token} 记录的状态（仓库 ${result.repo.root}）。`];
+    lines.push(...restoreReportBody(result));
+    if (result.undo !== undefined) lines.push(undoHint(result.undo, false));
     return { kind: 'success', text: lines.join('\n') };
   };
 
@@ -1473,6 +1571,106 @@ export function apply(ctx) {
     live: ctx.get('sessions'),
   });
 
+  /** Cordis 暴露 effect 诊断树的符号：`Symbol.for('cordis.effect')`。 */
+  const EFFECT_META = Symbol.for('cordis.effect');
+
+  /**
+   * 一次卸载能拿到的生命周期边界。DSH 把每个 Agent 的会话写句柄
+   * 交给 `agentLoop.lifecycle(<id>)` 这一个 effect 持有：它的清理
+   * 依次停驱动、排空并关闭写句柄、把会话与 Agent 摘出各自的注册表。
+   * 因此"把会话从本次运行中卸载"= 调用那个 effect 的清理器，而
+   * 清理器只在 Cordis 的运行时注册表里可见。
+   * @param {string} sessionId - 要卸载的会话。
+   * @returns {Array<() => any>} 找到的清理器（正常至多一个）。
+   */
+  const lifecycleDisposers = (sessionId) => {
+    const label = `agentLoop.lifecycle(${sessionId})`;
+    const found = [];
+    const seen = new Set();
+    const collect = (fiber) => {
+      // `ctx.fiber` 与插件 fiber 可能不是同一个对象，两者都要看。
+      const owner = fiber?.ctx?.fiber ?? fiber;
+      if (owner === undefined || owner === null || seen.has(owner)) return;
+      seen.add(owner);
+      const disposables = owner._disposables;
+      if (disposables === undefined || typeof disposables[Symbol.iterator] !== 'function') return;
+      for (const disposer of disposables) {
+        if (typeof disposer !== 'function') continue;
+        if (disposer[EFFECT_META]?.label !== label) continue;
+        found.push(disposer);
+      }
+    };
+    const registry = ctx.registry;
+    if (registry === undefined || typeof registry.values !== 'function') return found;
+    for (const runtime of registry.values()) {
+      const fibers = runtime?.fibers;
+      if (fibers === undefined || typeof fibers[Symbol.iterator] !== 'function') continue;
+      for (const fiber of fibers) collect(fiber);
+    }
+    return found;
+  };
+
+  /** 卸载等待驱动停下与关闭写句柄的上限；超过就报告失败，而不是把命令挂住。 */
+  const EVICT_TIMEOUT_MS = 10_000;
+
+  /**
+   * 在 `EVICT_TIMEOUT_MS` 内等待 `promise`，超时以错误结束。
+   * @param {Promise<any>} promise - 被等待的操作。
+   * @param {string} what - 超时文案里的动作名。
+   * @returns {Promise<any>} 操作结果。
+   * @throws 超时后。
+   */
+  const withinDeadline = (promise, what) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${what}超时`)), EVICT_TIMEOUT_MS);
+      // 超时计时器不应让进程为了它多活一会儿。
+      timer.unref?.();
+      // 无论哪边先到，都要清掉计时器并吞掉败方的结果，
+      // 否则一个超时后的拒绝会变成未处理的 rejection。
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+
+  /**
+   * 把仍驻留在本次 DSH 运行中的会话卸下来：先请各提供方停掉它的
+   * 工作（进行中的回合、计划任务等），再关闭持有写句柄的生命周期
+   * effect —— 那个清理器自己会取消驱动、等它 idle、排空并关闭写句柄，
+   * 最后把会话与 Agent 摘出各自的注册表。句柄一关，内核锁随之释放，
+   * 会话目录才可以被真正删除，而不是在下一次 flush 时被重建。
+   * @param {string} sessionId - 要卸载的会话。
+   * @returns {Promise<{failures: string[]}>} 卸载过程中出了什么问题。
+   */
+  const evictSession = async (sessionId) => {
+    // 只有失败会被读出来 —— 卸载成功与否由卸载之后的重新检查决定。
+    const report = { failures: [] };
+    // 归档准入的 stop 家族是唯一公开的"停"通道：它会取消进行中的
+    // 回合，并让计划任务等提供方结束针对该会话的工作。先停工作再
+    // 拆生命周期，teardown 才能真的走到 idle。
+    if (typeof ctx.parallel === 'function') {
+      try {
+        await withinDeadline(ctx.parallel('workspace/session-stop', { sessionId }), '停掉会话的工作');
+      } catch (error) {
+        report.failures.push(`停掉工作失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    for (const dispose of lifecycleDisposers(sessionId)) {
+      try {
+        await withinDeadline(Promise.resolve(dispose()), '卸载生命周期');
+      } catch (error) {
+        report.failures.push(`卸载生命周期失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return report;
+  };
+
   /**
    * 一个已存储会话所拥有的目录。Persistence 快照把
    * 日志文件命名为 `<root>/<cwd key>/<session segment>/session…`，其中
@@ -1504,13 +1702,20 @@ export function apply(ctx) {
    * 删除需要其中之一来定位会话的投影检查点：每条记录一份
    * 文档，保存投影值 —— 其中包括标题和
    * 首个提示词。
-   * @returns {string[]} 解析出的根，按注册顺序。
+   *
+   * `root` 不是 `StorageBackend` 接口上的字段，而是随附 json 后端的
+   * 私有构造参数（运行时读得到，但它不在服务契约里）。所以这里分清
+   * 两种情况：后端列表为空 —— 没有东西要清理；后端列表不为空却一个根
+   * 都读不出来 —— 布局变了，删除必须拒绝而不是"以为没有缓存"。
+   * @returns {{roots: string[], readable: boolean}} 解析出的根与它们是否可读。
    */
   const storageRootsOf = () => {
     const backend = ctx.get('storage')?.backend;
-    if (typeof backend?.names !== 'function') return [];
+    if (typeof backend?.names !== 'function') return { roots: [], readable: true };
     const roots = [];
+    let named = 0;
     for (const name of backend.names()) {
+      named += 1;
       try {
         const root = backend.get(name)?.root;
         if (typeof root === 'string' && root !== '') {
@@ -1521,7 +1726,7 @@ export function apply(ctx) {
         // 在列出与读取之间注销掉的后端。
       }
     }
-    return roots;
+    return { roots, readable: named === 0 || roots.length > 0 };
   };
 
   /**
@@ -1530,11 +1735,22 @@ export function apply(ctx) {
    * `<root>/session_projcache/sessions/<id>.json`，但哪个已注册的根
    * 服务该域由路由决定，不是本插件的事 —— 所以每个
    * 候选都被列出，缺失的那个就只是没有东西可删。
+   *
+   * 会话 id 是外部输入：含有 `../` 时拼出来的路径会逃出那个目录，
+   * 而这里要删的是文件，所以逃出去的候选一律丢弃。
    * @param {string} sessionId - 其检查点被列出的会话。
    * @returns {string[]} 绝对的候选路径。
    */
-  const projectionCheckpointsOf = (sessionId) =>
-    storageRootsOf().map((root) => path.join(root, 'session_projcache', 'sessions', `${sessionId}.json`));
+  const projectionCheckpointsOf = (sessionId) => {
+    const paths = [];
+    for (const root of storageRootsOf().roots) {
+      const base = path.resolve(root, 'session_projcache', 'sessions');
+      const candidate = path.resolve(base, `${sessionId}.json`);
+      if (candidate !== base && !candidate.startsWith(base + path.sep)) continue;
+      paths.push(candidate);
+    }
+    return paths;
+  };
 
   /** 一个人类可读的字节数；不是有效值时为 undefined。 */
   const formatBytes = (bytes) => {
@@ -1562,20 +1778,35 @@ export function apply(ctx) {
     if (located.unverifiable === true) throw new Error('会话目录的命名与存储布局不符，拒绝删除。');
     const directory = located.directory;
     const root = typeof persistence.root === 'string' ? path.resolve(persistence.root) : undefined;
-    if (directory !== undefined && root !== undefined) {
+    if (directory !== undefined) {
+      // `root` 不是 `SessionPersistence` 接口上的字段，而是随附 jsonl
+      // 后端的私有构造参数。读不到它就意味着无法验证待删目录在不在
+      // 会话根内 —— 删除是不可逆的，宁可拒绝，也不把一个没验证过的
+      // 路径交给递归删除。
+      if (root === undefined) {
+        throw new Error('无法验证会话目录是否在会话根内（宿主版本的存储布局变了），拒绝删除。');
+      }
       const resolved = path.resolve(directory);
       // 这条命令删除的唯一目录来自存储本身，
       // 但一个改变了布局的存储必须大声失败，而不是把
       // 自己根之外的路径交给递归删除。
       if (!resolved.startsWith(root + path.sep)) throw new Error('会话目录不在会话根内，拒绝删除。');
     }
+    // 同样的道理：投影缓存的根读不出来，就无法确认它的检查点会被
+    // 一起清掉 —— 那份文档里留着标题和首个提示词。
+    if (!storageRootsOf().readable) {
+      throw new Error('无法定位会话的投影缓存（宿主版本的存储布局变了），拒绝删除。');
+    }
     return {
       sessionId,
       directory,
       sizeBytes: Number.isSafeInteger(snapshot.sizeBytes) ? snapshot.sizeBytes : undefined,
       // 本进程实体化过的会话仍在日志上持有写入者，所以
-      // 存储会在下次 flush 时重新创建产物。
+      // 存储会在下次 flush 时重新创建产物 —— 除非先把那个
+      // 生命周期卸下来。
       resident: live?.get?.(sessionId) !== undefined,
+      /** 能找到可卸载的生命周期边界，删除才可能强制进行。 */
+      evictable: lifecycleDisposers(sessionId).length > 0,
       cachePaths: projectionCheckpointsOf(sessionId),
       cwd: typeof header.cwd === 'string' && header.cwd !== '' ? header.cwd : undefined,
     };
@@ -1584,17 +1815,27 @@ export function apply(ctx) {
   /**
    * 一次检查对应的确认卡片主体。
    * @param {object} inspection - `inspectDeletion` 的结果。
+   * @param {{force: boolean}} request - 用户是否要求强制删除。
    * @returns {string} 报告文本。
    */
-  const describeDeletion = (inspection) => {
+  const describeDeletion = (inspection, request = { force: false }) => {
     const lines = [`会话：${inspection.sessionId}`];
     if (inspection.directory !== undefined) lines.push(`目录：${inspection.directory}`);
     const size = formatBytes(inspection.sizeBytes);
     if (size !== undefined) lines.push(`会话日志：${size}`);
     lines.push('同时清除工作区注册表中的归档、置顶与成员记录，以及该会话的投影缓存。');
     if (inspection.resident) {
-      lines.push('该会话仍在本次 DSH 运行中驻留，现在无法删除；请重启 DSH 后再试。');
-      return lines.join('\n');
+      if (inspection.evictable) {
+        lines.push(
+          request.force
+            ? '该会话仍在本次 DSH 运行中驻留，将先把它从本次运行中卸载（停掉进行中的回合、关闭日志写句柄），再删除它的数据。'
+            : '该会话仍在本次 DSH 运行中驻留，现在无法删除；加上 --force 可以卸载它后再删，或者重启 DSH 后再试。',
+        );
+        if (!request.force) return lines.join('\n');
+      } else {
+        lines.push('该会话仍在本次 DSH 运行中驻留，且找不到它的生命周期边界（宿主版本不同？），只能重启 DSH 后再删。');
+        return lines.join('\n');
+      }
     }
     if (inspection.directory === undefined && inspection.cachePaths.length === 0) {
       lines.push('这个会话没有落盘数据可删。');
@@ -1629,14 +1870,29 @@ export function apply(ctx) {
   /**
    * 永久移除一个会话：它的产物、它的投影检查点，以及
    * 每一条指向它的注册表记录，然后告诉已连接的浏览器半边列表
-   * 变了。本进程实体化过的会话会被拒绝，因为它的写入者
-   * 仍持有日志。
+   * 变了。本进程实体化过的会话默认会被拒绝，因为它的写入者
+   * 仍持有日志；`force` 先把它从本次运行中卸载，再删文件。
    * @param {string} sessionId - 要移除的会话。
-   * @returns {Promise<object>} 本次移除所依据的检查结果。
+   * @param {{force?: boolean}} options - 是否卸载仍驻留的会话。
+   * @returns {Promise<{inspection: object, evicted: object|undefined}>} 本次移除所依据的检查结果，以及卸载做了什么。
    */
-  const removeSession = async (sessionId) => {
-    const inspection = await inspectDeletion(sessionId);
-    if (inspection.resident) throw new Error('该会话仍在本次 DSH 运行中驻留，重启后再删除。');
+  const removeSession = async (sessionId, options = {}) => {
+    let inspection = await inspectDeletion(sessionId);
+    let evicted;
+    if (inspection.resident) {
+      if (options.force !== true) throw new Error('该会话仍在本次 DSH 运行中驻留，重启后再删除；或加上 --force 卸载它。');
+      if (!inspection.evictable) {
+        throw new Error('该会话仍在本次 DSH 运行中驻留，而且找不到它的生命周期边界，只能重启 DSH 后再删。');
+      }
+      evicted = await evictSession(sessionId);
+      // 卸载之后重新检查：句柄若没关掉，文件会在下一次 flush 时
+      // 被重建，所以这里必须相信重新读到的驻留状态，而不是猜测。
+      inspection = await inspectDeletion(sessionId);
+      if (inspection.resident) {
+        const detail = evicted.failures.length > 0 ? `（${evicted.failures.join('；')}）` : '';
+        throw new Error(`没能把这个会话从本次运行中卸载${detail}，重启 DSH 后再删除。`);
+      }
+    }
     if (inspection.directory !== undefined) await rm(inspection.directory, { recursive: true, force: true });
     for (const checkpoint of inspection.cachePaths) await rm(checkpoint, { force: true });
     await forgetSession(inspection);
@@ -1644,18 +1900,18 @@ export function apply(ctx) {
     // 每个已连接的浏览器半边。持久层不再列出该会话，所以
     // 下一次列表基线无法把这行带回来。
     ctx.emit('api-session/removed', sessionId);
-    return inspection;
+    return { inspection, evicted };
   };
 
   /**
    * 解析一行 `/delete-session`：`--id <sessionId>` 以及可选的
-   * `--plan`。不可用的参数是错误，绝不静默回落 ——
+   * `--plan`、`--force`。不可用的参数是错误，绝不静默回落 ——
    * 删除是永久的，所以没有值的 `--id` 绝不能挑一个会话。
    * @param {unknown} line - 原始命令输入。
-   * @returns {{sessionId?: string, plan: boolean, error?: string}} 请求。
+   * @returns {{sessionId?: string, plan: boolean, force: boolean, error?: string}} 请求。
    */
   const parseDeleteLine = (line) => {
-    const request = { sessionId: undefined, plan: false, error: undefined };
+    const request = { sessionId: undefined, plan: false, force: false, error: undefined };
     const tokens = String(line ?? '')
       .split(/\s+/)
       .filter((token) => token !== '');
@@ -1663,6 +1919,10 @@ export function apply(ctx) {
       const token = tokens[position];
       if (token === '--plan') {
         request.plan = true;
+        continue;
+      }
+      if (token === '--force') {
+        request.force = true;
         continue;
       }
       if (token !== '--id') {
@@ -1775,15 +2035,15 @@ export function apply(ctx) {
 
   ctx.commands.register({
     name: DELETE_COMMAND_NAME,
-    description: '永久删除一个会话：它的落盘日志、投影缓存，以及工作区注册表里的归档、置顶与成员记录（不可恢复）',
-    input: { hint: '--id <sessionId> [--plan]' },
+    description: '永久删除一个会话：它的落盘日志、投影缓存，以及工作区注册表里的归档、置顶与成员记录（不可恢复）；--force 会先把仍驻留在本次运行中的会话卸载掉',
+    input: { hint: '--id <sessionId> [--plan] [--force]' },
     async handler(invocation) {
       const carrierId = invocation.agent?.id;
       const request = parseDeleteLine(invocation.rawInput);
       if (request.error !== undefined) {
         return {
           kind: 'error',
-          text: `${request.error}\n用法：/delete-session --id <sessionId> [--plan]`,
+          text: `${request.error}\n用法：/delete-session --id <sessionId> [--plan] [--force]`,
         };
       }
       if (request.sessionId === carrierId) {
@@ -1792,13 +2052,16 @@ export function apply(ctx) {
       try {
         const inspection = await inspectDeletion(request.sessionId);
         // 当删除不能运行时，预览会以 `error` 作答，这样
-        // 浏览器半边可以在用户确认之前就拒绝。
+        // 浏览器半边可以在用户确认之前就拒绝。要求了 `--force`
+        // 的预览说明卸载之后会做什么，因此它是可确认的。
         if (request.plan) {
-          return { kind: inspection.resident ? 'error' : 'success', text: describeDeletion(inspection) };
+          const blocked = inspection.resident && (request.force !== true || !inspection.evictable);
+          return { kind: blocked ? 'error' : 'success', text: describeDeletion(inspection, { force: request.force === true }) };
         }
-        await removeSession(request.sessionId);
+        const { inspection: removed, evicted } = await removeSession(request.sessionId, { force: request.force === true });
         const lines = [`已永久删除会话 ${request.sessionId}。`];
-        if (inspection.directory !== undefined) lines.push(`目录已移除：${inspection.directory}`);
+        if (evicted !== undefined) lines.push('删除前已把这个会话从本次 DSH 运行中卸载。');
+        if (removed.directory !== undefined) lines.push(`目录已移除：${removed.directory}`);
         return { kind: 'success', text: lines.join('\n') };
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);

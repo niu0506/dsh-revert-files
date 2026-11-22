@@ -7,7 +7,7 @@
  *   （`conversation.chat.user.before`）只交出持久化的消息 `source`，
  *   别的什么都不给，所以轮次号是拿这个 source 与
  *   该行所构建的用户节点做匹配、从 Chat 快照里反查出来的。
- *   该控件被传送到该行自己的操作条里，紧挨着复制控件，
+ *   该控件被传送到该行自己的操作条里，排在已有控件之后，
  *   当找不到那条操作条时，就退回气泡上方的座位。
  *   随后它把 `/revert --turn N` 转交给会话，宿主便从该轮次
  *   之前拍下的 Git 快照恢复整个工作区，
@@ -49,6 +49,7 @@ window.__ModuleLoader__.load({
       'action.failed': '撤回失败',
       'action.title': '把工作区恢复到这条消息发出之前（整轮回退，基于 Git 快照）',
       'action.checking': '检查中…',
+      'action.submitted': '已提交',
       'dialog.turn.title': '撤回这一轮？',
       'dialog.file.title': '撤回该文件？',
       'dialog.confirm': '确认撤回',
@@ -56,25 +57,67 @@ window.__ModuleLoader__.load({
       'dialog.close': '关闭',
       'dialog.fallback': '将还原本轮修改的文件，并撤回这一轮开始的对话内容（不可撤销）。',
       'dialog.noHost': '宿主没有回报预览（可能正忙），无法确认这一步；请稍后再试。',
-      'file.revert': '撤回',
-      'file.reverting': '撤回中…',
-      'file.done': '已撤回',
-      'file.failed': '撤回失败',
+      'dialog.noCommand': '宿主还没有装配撤回命令 —— 宿主半边的改动要重启 DSH 才生效。',
+      'dialog.noCarrier': '撤回命令没能送进会话，请先打开任意一个已有对话的会话再试。',
       'file.title': '把该文件恢复到本轮修改之前的内容',
-      'file.checking': '检查中…',
       'menu.deleteSession': '删除会话（永久）',
       'delete.title': '永久删除这个会话？',
       'delete.confirm': '永久删除',
+      'delete.forceTitle': '从本次运行中卸载并永久删除这个会话？',
+      'delete.forceConfirm': '强制删除',
       'delete.cancel': '取消',
       'delete.close': '关闭',
       'delete.planning': '正在检查这个会话…',
       'delete.deleting': '正在删除…',
+      'delete.forcing': '正在卸载并删除…',
       'delete.failed': '删除失败',
       'delete.noCarrier': '删除需要另一个会话来承载这条命令，请先打开任意一个其它会话。',
       'delete.noHost': '宿主接受了删除命令，但没有回报检查结果（可能正忙）。',
       'delete.unavailable': '宿主还没有装配删除命令 —— 宿主半边的改动要重启 DSH 才生效。',
-      'delete.unreachable': '删除命令没能送进承载会话，请先打开任意一个已有对话的会话再试。',
-      'delete.cancelled': '已取消。',
+      'delete.selfOnly': '侧边栏里只有这一个会话。删除必须由另一个会话承载命令，请先打开任意一个其它会话再试。',
+      'delete.refusedByCarrier': '承载会话没有接受这条删除命令（它可能还没有可用的 Agent），请先在侧边栏打开任意一个已有对话的会话再试。',
+      'delete.badId': '这个会话的 ID 无法安全地传给宿主命令，拒绝删除。',
+    };
+
+    /**
+     * 英文字典。区域设置运行时的回退链是"当前语言 → en → 裸 key"，
+     * 所以只注册中文的话，英文界面下每个文案都会显示成它的 key。
+     */
+    const en = {
+      'action.revert': 'Revert',
+      'action.reverting': 'Reverting…',
+      'action.done': 'Reverted',
+      'action.failed': 'Revert failed',
+      'action.title': 'Restore the workspace to just before this message (whole-turn revert, from Git snapshots)',
+      'action.checking': 'Checking…',
+      'action.submitted': 'Submitted',
+      'dialog.turn.title': 'Revert this turn?',
+      'dialog.file.title': 'Revert this file?',
+      'dialog.confirm': 'Revert',
+      'dialog.cancel': 'Cancel',
+      'dialog.close': 'Close',
+      'dialog.fallback': 'Restores the files this turn changed and rolls the conversation back to before it (irreversible).',
+      'dialog.noHost': 'The host did not report a preview (it may be busy), so this step cannot be confirmed. Try again later.',
+      'dialog.noCommand': 'The host has not loaded the revert command yet — restart DSH to pick up host-side changes.',
+      'dialog.noCarrier': 'The revert command could not be delivered. Open any session that already has a conversation and try again.',
+      'file.title': 'Restore this file to its contents before this turn changed it',
+      'menu.deleteSession': 'Delete session (permanent)',
+      'delete.title': 'Permanently delete this session?',
+      'delete.confirm': 'Delete permanently',
+      'delete.forceTitle': 'Unload from this run and permanently delete this session?',
+      'delete.forceConfirm': 'Force delete',
+      'delete.cancel': 'Cancel',
+      'delete.close': 'Close',
+      'delete.planning': 'Checking this session…',
+      'delete.deleting': 'Deleting…',
+      'delete.forcing': 'Unloading and deleting…',
+      'delete.failed': 'Delete failed',
+      'delete.noCarrier': 'Deleting needs another session to carry the command. Open any other session first.',
+      'delete.noHost': 'The host accepted the delete command but never reported the check result (it may be busy).',
+      'delete.unavailable': 'The host has not loaded the delete command yet — restart DSH to pick up host-side changes.',
+      'delete.selfOnly': 'This is the only session in the sidebar. Deleting must be carried by another session — open any other session first.',
+      'delete.refusedByCarrier': 'The carrying session did not accept the delete command (it may not have a usable agent yet). Open any session that already has a conversation and try again.',
+      'delete.badId': 'This session id cannot be passed to the host command safely; refusing to delete it.',
     };
 
     /** 操作条控件、确认卡片，以及气泡上方的回退控件。 */
@@ -351,6 +394,60 @@ window.__ModuleLoader__.load({
     const DELETE_COMMAND_NAME = 'delete-session';
 
     /**
+     * 一个可以安全拼进命令行的会话 id。
+     *
+     * 宿主按空白切分命令行，所以 id 里不能有空白；`--` 开头的值会被
+     * 当成缺失的参数。宿主生成的 id 不会长成这样，这里只是不让一个
+     * 异常的 id 悄悄改变命令的解析结果。
+     * @param {unknown} sessionId - 会话 id。
+     * @returns {string|undefined} 校验通过的 id；否则为 undefined。
+     */
+    function safeSessionId(sessionId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return undefined;
+      return /^[A-Za-z0-9._:@-]+$/.test(sessionId) ? sessionId : undefined;
+    }
+
+    /**
+     * 一条命令行里，命令名之后的参数部分。
+     *
+     * 宿主把 `command/run` 的 `args` 记成命令名之后的原文，所以这里
+     * 去掉命令名与分隔符，得到的就是同一串词元。
+     * @param {string} line - 完整的命令行。
+     * @returns {string} 参数部分；无法解析时为 ''。
+     */
+    function argumentsOf(line) {
+      const match = /^\s*\/\S*\s*(.*)$/.exec(String(line ?? ''));
+      if (match === null) return '';
+      return match[1].trim();
+    }
+
+    /**
+     * 两条参数串是否说的是同一件事。
+     *
+     * 按空白切开的词元序列必须完全一致：只比较"含不含 `--plan`"会
+     * 让本插件认领别人的运行 —— 用户手敲的 `/revert --turn 9 --plan`
+     * 会被当成本插件自己的预览，于是卡片显示第 9 轮的文件清单，确认
+     * 时执行的却是另一轮。
+     * @param {string} left - 宿主记录下来的参数。
+     * @param {string} right - 客户端自己发出的参数。
+     * @param {string} name - 命令名；两边开头带着它时都去掉。
+     * @returns {boolean} 两者等价时为 true。
+     */
+    function sameArguments(left, right, name = COMMAND_NAME) {
+      if (typeof left !== 'string' || typeof right !== 'string') return false;
+      const tokens = (value) => value.trim().split(/\s+/).filter((token) => token !== '');
+      // 宿主记下的参数有可能带着命令名（`revert --turn 4`），也有可能
+      // 不带（`--turn 4`）；两种形状都要能对上。
+      const strip = (list) => {
+        if (list.length === 0) return list;
+        return list[0] === name || list[0] === `/${name}` ? list.slice(1) : list;
+      };
+      const first = strip(tokens(left));
+      const second = strip(tokens(right));
+      return first.length === second.length && first.every((token, index) => token === second[index]);
+    }
+
+    /**
      * 日志在 `afterSeq` 之后完成的某条宿主命令的最新一次运行，
      * 按类别区分：`--plan` 预览运行，或实际执行运行。
      * 宿主会持久地记录 `command/run`/`command/done` 行，
@@ -360,9 +457,10 @@ window.__ModuleLoader__.load({
      * @param afterSeq - 忽略位于该位置及之前的行。
      * @param plan - `--plan` 运行为 true，执行运行为 false。
      * @param name - 要读取其行的宿主命令。
+     * @param expectedArgs - 客户端自己发出的参数串；给出时只认这一条运行。
      * @returns `{kind, text}`；宿主尚未作答时为 undefined。
      */
-    function commandOutcome(events, afterSeq, plan, name = COMMAND_NAME) {
+    function commandOutcome(events, afterSeq, plan, name = COMMAND_NAME, expectedArgs = undefined) {
       const tracked = new Set();
       let outcome;
       for (const event of events) {
@@ -371,6 +469,7 @@ window.__ModuleLoader__.load({
         if (event.type === 'command/run') {
           if (data?.name !== name) continue;
           if (typeof data.args !== 'string' || data.args.includes('--plan') !== plan) continue;
+          if (expectedArgs !== undefined && !sameArguments(data.args, expectedArgs, name)) continue;
           if (typeof data.commandId === 'string') tracked.add(data.commandId);
         } else if (event.type === 'command/done' && typeof data?.commandId === 'string' && tracked.has(data.commandId)) {
           outcome = {
@@ -383,28 +482,32 @@ window.__ModuleLoader__.load({
     }
 
     /** 等待某条宿主命令运行的某一类别到达会话日志。 */
-    function waitForCommand(owner, afterSeq, plan, timeoutMs, name = COMMAND_NAME) {
+    function waitForCommand(owner, afterSeq, plan, timeoutMs, name = COMMAND_NAME, expectedArgs = undefined) {
       return new Promise((resolve) => {
         const source = journalOf(owner);
         if (typeof source?.subscribe !== 'function') {
           resolve(undefined);
           return;
         }
+        // 这两个变量必须在 `finish` 之前声明：`subscribe` 可能同步回调
+        // 监听器，那时 `finish` 会立刻读到它们。用 `const` 声明在后面
+        // 会撞上暂时性死区，把一个普通的 store 变成永不 settle 的 Promise。
         let unsubscribe;
+        let timer;
         let settled = false;
         const finish = (value) => {
           if (settled) return;
           settled = true;
-          clearTimeout(timer);
+          if (timer !== undefined) clearTimeout(timer);
           unsubscribe?.();
           resolve(value);
         };
         const scan = () => {
-          const outcome = commandOutcome(journalEvents(owner), afterSeq, plan, name);
+          const outcome = commandOutcome(journalEvents(owner), afterSeq, plan, name, expectedArgs);
           if (outcome !== undefined) finish(outcome);
         };
         unsubscribe = source.subscribe(scan);
-        const timer = setTimeout(() => finish(undefined), timeoutMs);
+        timer = setTimeout(() => finish(undefined), timeoutMs);
         scan();
       });
     }
@@ -442,9 +545,12 @@ window.__ModuleLoader__.load({
      * @param sessionId - 所属会话。
      * @param line - `--plan` 命令行。
      * @param name - 该行所驱动的宿主命令。
-     * @returns `{kind, text}` 报告；宿主对该行没有处理者时为
-     *   `{kind: 'unavailable'}`；没有会话能承载它时为 `{kind: 'unreachable'}`；
-     *   宿主认领了却从未回报时为 undefined。
+     * @returns `{kind, text}` 报告：
+     *   - `success`：宿主回报了计划，`text` 是它的原文；
+     *   - `error`：宿主拒绝了这个计划，`text` 是它的理由；
+     *   - `unavailable`：宿主没有这条命令的处理者；
+     *   - `unreachable`：没有会话能承载这条命令；
+     *   - `no-report`：宿主认领了命令，却没有在期限内回报。
      */
     async function requestPlan(sessionId, line, name = COMMAND_NAME) {
       const outcome = await withSession(sessionId, async (session) => {
@@ -452,13 +558,17 @@ window.__ModuleLoader__.load({
         const after = lastSeqOf(session);
         // 等待在该行发出之前就已布好，所以立即作答的宿主
         // 也不会被错过。
-        const waiting = waitForCommand(session, after, true, PLAN_TIMEOUT_MS, name);
+        const waiting = waitForCommand(session, after, true, PLAN_TIMEOUT_MS, name, argumentsOf(line));
         const admission = await session.command(line).catch(() => undefined);
         // 准入判定先行，并立即作答：为一条没有处理者认领的行把日志窗口
         // 等完，只会掩盖真正的原因。
         if (admission?.ok !== true) return { kind: 'unreachable' };
         if (admission.value?.matched !== true) return { kind: 'unavailable' };
-        return await waiting;
+        // 宿主认领了这条命令，却没有在期限内回报：这是"没有报告"，
+        // 与"没有处理者"是两件不同的事，必须能被区分开 —— 前者可以
+        // 重试，后者要重启宿主。
+        const report = await waiting;
+        return report === undefined ? { kind: 'no-report' } : report;
       });
       return outcome ?? { kind: 'unreachable' };
     }
@@ -496,7 +606,9 @@ window.__ModuleLoader__.load({
         if (!isRecord(location)) continue;
         if (location.kind !== 'turn' && location.kind !== 'step') continue;
         const turn = isRecord(location.turn) ? location.turn.turn : undefined;
-        return Number.isSafeInteger(turn) && turn > 0 ? turn : undefined;
+        if (Number.isSafeInteger(turn) && turn > 0) return turn;
+        // 这一条节点没有可用的轮次：继续找下一条同源的节点，而不是
+        // 就此放弃 —— 同一个 source 可能对应多个节点。
       }
       return undefined;
     }
@@ -509,25 +621,31 @@ window.__ModuleLoader__.load({
      * @param sessionId - 所属会话。
      * @param line - 要执行的命令行。
      * @param name - 该行所驱动的宿主命令。
-     * @returns `{status: 'done'|'failed'|'unavailable', text}`，其中 `text` 是
-     *   宿主报告，`unavailable` 表示没有处理者认领该行。
+     * @param unavailableText - 没有处理者认领该行时的文案。
+     * @returns `{status: 'done'|'submitted'|'failed'|'unavailable', text}`，
+     *   其中 `text` 是宿主报告；`unavailable` 表示没有处理者认领该行，
+     *   `submitted` 表示宿主接受了该行但还没回报结果。
      */
-    async function runCommand(sessionId, line, name = COMMAND_NAME) {
+    async function runCommand(sessionId, line, name = COMMAND_NAME, unavailableText = undefined) {
       const outcome = await withSession(sessionId, async (session) => {
         if (typeof session?.command !== 'function') return undefined;
         const after = lastSeqOf(session);
-        const waiting = waitForCommand(session, after, false, EXECUTE_TIMEOUT_MS, name);
+        const waiting = waitForCommand(session, after, false, EXECUTE_TIMEOUT_MS, name, argumentsOf(line));
         const admission = await session.command(line).catch(() => undefined);
         // 没有处理者认领的行会立即得到答复；只有被认领的行
         // 才值得把日志窗口等完。
-        if (admission?.ok !== true || admission.value?.matched !== true) return { status: 'unavailable', text: undefined };
+        if (admission?.ok !== true || admission.value?.matched !== true) {
+          return { status: 'unavailable', text: unavailableText };
+        }
         const report = await waiting;
-        // 没有报告意味着等待超时：宿主接受了该行且仍在工作，
-        // 所以只有显式错误才算失败。
         if (report !== undefined && report.kind === 'error') return { status: 'failed', text: report.text };
-        return { status: 'done', text: report?.text };
+        // 没有报告意味着等待超时：宿主接受了该行且仍在工作。报成
+        // "失败"会误导，报成"已完成"同样不诚实 —— 所以单列一个
+        // "已提交"的状态，用户可以自己去核对工作区。
+        if (report === undefined) return { status: 'submitted', text: undefined };
+        return { status: 'done', text: report.text };
       });
-      return outcome ?? { status: 'unavailable', text: undefined };
+      return outcome ?? { status: 'unavailable', text: unavailableText };
     }
 
     /**
@@ -544,7 +662,7 @@ window.__ModuleLoader__.load({
             props.onCancel();
           }
         },
-        [props],
+        [props.onCancel],
       );
       return createPortal(
         h(
@@ -586,49 +704,116 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 一个撤回控件的按钮。两个入口共用它，只有样式类、标题词条与
+     * 状态词条前缀不同。
+     * @param props - 状态、失败文案、样式类、词条与点击回调。
+     * @returns 那个按钮。
+     */
+    function RevertButton(props) {
+      const { state, failure, className, titleKey, failureTitleKey, labelPrefix, translate, onClick } = props;
+      return h(
+        'button',
+        {
+          type: 'button',
+          className,
+          title: state === 'failed' ? (failure ?? translate(failureTitleKey)) : translate(titleKey),
+          'aria-label': translate(titleKey),
+          disabled: state === 'busy' || state === 'planning',
+          onClick,
+        },
+        labelOf(state, labelPrefix, translate),
+      );
+    }
+
+    /**
+     * 撤回的确认卡片。两个入口共用它，只有标题词条不同。
+     * @param props - 状态、计划文本、拒绝标志、标题词条与两个回调。
+     * @returns 卡片；还没到确认那一步时为 null。
+     */
+    function RevertConfirmDialog(props) {
+      const { state, plan, refused, titleKey, translate, onCancel, onConfirm } = props;
+      if (state !== 'confirm') return null;
+      return h(ConfirmDialog, {
+        title: translate(titleKey),
+        body: plan ?? translate('dialog.fallback'),
+        confirmLabel: translate('dialog.confirm'),
+        cancelLabel: translate(refused ? 'dialog.close' : 'dialog.cancel'),
+        confirmHidden: refused,
+        onCancel,
+        onConfirm,
+      });
+    }
+
+    /**
+     * 一次不可确认的结局该用哪句话解释。
+     * @param {any} report - 宿主的计划报告。
+     * @returns {string} 词条 key。
+     */
+    function refusalKeyOf(report) {
+      if (report?.kind === 'unavailable') return 'dialog.noCommand';
+      if (report?.kind === 'unreachable') return 'dialog.noCarrier';
+      return 'dialog.noHost';
+    }
+
+    /**
      * 一个撤回控件的状态机：询问宿主会改变什么，展示那份计划，
      * 然后才执行。状态依次为 idle → planning → confirm → busy →
-     * done | failed，取消则回到 idle。宿主拒绝的预览
-     * （没有快照、文件无法定位）或从未回报的预览仍会打开卡片，
-     * 但会置上 `refused` 且不提供破坏性控件：
-     * 再点一次也只会再次失败，而撤回是不可撤销的。
+     * done | failed，取消则回到 idle。
+     *
+     * 只有宿主**真正回报了计划**（`kind: 'success'`）才会武装确认按钮。
+     * 宿主的拒绝、没有处理者、没有承载会话、认领了却没回报 —— 这些
+     * 结局里没有一份可以照着做的清单，卡片因此只留「关闭」：撤回是
+     * 不可逆的，不能在用户没看到预览的情况下执行。
      * @param sessionId - 所属会话。
      * @param line - 要执行的 `/revert` 命令行。
-     * @param planLine - 带 `--plan` 的同一请求。
-     * @param unreachableText - 宿主从未回报预览时使用的文案。
+     * @param refusalText - 把一次不可确认的结局翻译成一句话。
      * @returns 状态、计划文本、拒绝标志，以及各个回调。
      */
-    function useRevertAction(sessionId, line, planLine, unreachableText) {
+    function useRevertAction(sessionId, line, refusalText) {
+      // 预览就是同一条命令加上 `--plan`，所以它由 `line` 决定，
+      // 不必让每个调用点各推一遍。
+      const planLine = line === undefined ? undefined : `${line} --plan`;
       const [state, setState] = React.useState('idle');
       const [plan, setPlan] = React.useState(undefined);
       const [refused, setRefused] = React.useState(false);
       const [failure, setFailure] = React.useState(undefined);
       const mounted = React.useRef(true);
-      React.useEffect(
-        () => () => {
+      // StrictMode 会 mount → cleanup → mount。cleanup 把这个标志置为
+      // false 之后必须重新置回 true，否则之后的每一次 settle 都成了
+      // 空操作，按钮永远停在「检查中…」。
+      React.useEffect(() => {
+        mounted.current = true;
+        return () => {
           mounted.current = false;
-        },
-        [],
-      );
+        };
+      }, []);
+      // 请求令牌：一次预览在途时 props 可能已经变了（审查面板切到另一个
+      // 文件、该行的轮次变化），旧响应不能盖到新的目标上。
+      const token = React.useRef(0);
       const settle = React.useCallback((next, detail) => {
         if (!mounted.current) return;
         setFailure(detail);
         setState(next);
       }, []);
       const run = React.useCallback(() => {
-        if (line === undefined || planLine === undefined || sessionId === undefined) return;
+        if (line === undefined || sessionId === undefined) return;
         setFailure(undefined);
         setRefused(false);
         setState('planning');
-        requestPlan(sessionId, planLine).then((report) => {
-          if (!mounted.current) return;
-          // 完全没有报告，就是宿主从未作答；`kind: 'error'` 则是
-          // 宿主自己的拒绝。两者都没有什么可确认的。
-          setPlan(report === undefined ? unreachableText : report.text);
-          setRefused(report === undefined || report.kind === 'error');
-          setState('confirm');
-        }, () => settle('failed'));
-      }, [line, planLine, sessionId, settle, unreachableText]);
+        const mine = (token.current += 1);
+        requestPlan(sessionId, planLine).then(
+          (report) => {
+            if (!mounted.current || token.current !== mine) return;
+            const answered = report !== undefined && report.kind === 'success';
+            // 宿主的拒绝带它自己的理由；其余结局用一句话说明为什么
+            // 不能确认。
+            setPlan(answered ? report.text : report.kind === 'error' ? report.text : refusalText(report));
+            setRefused(!answered);
+            setState('confirm');
+          },
+          () => settle('failed'),
+        );
+      }, [line, sessionId, settle, refusalText]);
       const cancel = React.useCallback(() => {
         setPlan(undefined);
         setRefused(false);
@@ -639,8 +824,13 @@ window.__ModuleLoader__.load({
         setPlan(undefined);
         setRefused(false);
         setState('busy');
-        runCommand(sessionId, line).then((outcome) => settle(outcome.status === 'done' ? 'done' : 'failed', outcome.text));
-      }, [line, sessionId, settle]);
+        runCommand(sessionId, line, COMMAND_NAME, refusalText({ kind: 'unavailable' })).then((outcome) =>
+          settle(
+            outcome.status === 'done' ? 'done' : outcome.status === 'submitted' ? 'submitted' : 'failed',
+            outcome.text,
+          ),
+        );
+      }, [line, sessionId, settle, refusalText]);
       return { state, plan, refused, failure, run, cancel, confirm };
     }
 
@@ -648,6 +838,7 @@ window.__ModuleLoader__.load({
     function labelOf(state, prefix, translate) {
       if (state === 'planning') return translate(`${prefix}.checking`);
       if (state === 'busy') return translate(`${prefix}.reverting`);
+      if (state === 'submitted') return translate(`${prefix}.submitted`);
       if (state === 'done') return translate(`${prefix}.done`);
       if (state === 'failed') return translate(`${prefix}.failed`);
       return translate(`${prefix}.revert`);
@@ -675,9 +866,26 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 读取这一行所属轮次的聊天快照。
+     *
+     * `useChat` 是座位契约的标准 props，所以它在整个生命周期里都在。
+     * 这个 hook 始终被调用 —— 条件式调用会违反 React 的 hook 数量
+     * 规则：一旦这个 props 在两次渲染之间出现或消失，React 就会抛出
+     * "渲染的 hook 数量变少了"。
+     * @param {any} useChat - 座位提供的聊天快照读取器。
+     * @param {(snapshot: any) => number|undefined} select - 选择器。
+     * @returns {number|undefined} 轮次号；读不到时为 undefined。
+     */
+    function useTurnNumber(useChat, select) {
+      const [fallback] = React.useState(undefined);
+      if (typeof useChat !== 'function') return fallback;
+      return useChat(select);
+    }
+
+    /**
      * 单个用户消息行的撤回控件。所属座位渲染在气泡之前，
      * 所以该控件被传送到该行自己的操作条里，
-     * 紧挨着复制控件；找不到操作条的行则保留
+     * 已有控件之后；找不到操作条的行则保留
      * 气泡上方的座位作为回退。
      * @param props - 所属者的 `{source, kind}` 加上标准座位 props。
      * @returns 该控件；该行的轮次未知时为 null。
@@ -688,17 +896,10 @@ window.__ModuleLoader__.load({
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined;
       const useChat = props.useChat;
       const select = React.useCallback((snapshot) => turnOfSource(snapshot, source), [source]);
-      // `useChat` 是座位契约标准 props 的一部分，所以这个条件
-      // 在该行的整个生命周期内都是稳定的。
-      const turn = typeof useChat === 'function' ? useChat(select) : undefined;
+      const turn = useTurnNumber(useChat, select);
       const line = Number.isSafeInteger(turn) && turn > 0 ? `/revert --turn ${turn}` : undefined;
-      const planLine = line === undefined ? undefined : `${line} --plan`;
-      const { state, plan, refused, failure, run, cancel, confirm } = useRevertAction(
-        sessionId,
-        line,
-        planLine,
-        translate('dialog.noHost'),
-      );
+      const refusalText = React.useCallback((report) => translate(refusalKeyOf(report)), [translate]);
+      const { state, plan, refused, failure, run, cancel, confirm } = useRevertAction(sessionId, line, refusalText);
       const active = props.kind === 'user' && line !== undefined;
       const anchorRef = React.useRef(null);
       const [host, setHost] = React.useState(null);
@@ -733,33 +934,27 @@ window.__ModuleLoader__.load({
         };
       }, [active]);
 
-      if (props.kind !== 'user') return null;
-      if (line === undefined) return null;
+      if (!active) return null;
 
-      const button = h(
-        'button',
-        {
-          type: 'button',
-          className: host === null ? undefined : 'dshrvact',
-          title: state === 'failed' && failure !== undefined ? failure : translate('action.title'),
-          'aria-label': translate('action.title'),
-          disabled: state === 'busy' || state === 'planning',
-          onClick: run,
-        },
-        labelOf(state, 'action', translate),
-      );
-      const dialog =
-        state === 'confirm'
-          ? h(ConfirmDialog, {
-              title: translate('dialog.turn.title'),
-              body: plan ?? translate('dialog.fallback'),
-              confirmLabel: translate('dialog.confirm'),
-              cancelLabel: translate(refused ? 'dialog.close' : 'dialog.cancel'),
-              confirmHidden: refused,
-              onCancel: cancel,
-              onConfirm: confirm,
-            })
-          : null;
+      const button = h(RevertButton, {
+        state,
+        failure,
+        className: host === null ? undefined : 'dshrvact',
+        titleKey: 'action.title',
+        failureTitleKey: 'action.title',
+        labelPrefix: 'action',
+        translate,
+        onClick: run,
+      });
+      const dialog = h(RevertConfirmDialog, {
+        state,
+        plan,
+        refused,
+        titleKey: 'dialog.turn.title',
+        translate,
+        onCancel: cancel,
+        onConfirm: confirm,
+      });
 
       return h(
         React.Fragment,
@@ -786,12 +981,17 @@ window.__ModuleLoader__.load({
       const rawIndex = params.get('index');
       if (sessionId === null || sessionId === '') return null;
       if (rawSeq === null || rawSeq === '' || rawIndex === null || rawIndex === '') return null;
-      // `Number('')` 为 0，所以上面的空串检查才是拦住一条没有坐标的路由、
-      // 不让它渲染出必然失败的控件的关键。
-      const seq = Number(rawSeq);
-      const index = Number(rawIndex);
-      if (!Number.isSafeInteger(seq) || !Number.isSafeInteger(index)) return null;
-      if (seq < 0 || index < 0) return null;
+      // 宿主按 `/^(0|[1-9][0-9]*)$/` 解析坐标。`Number()` 还会接受
+      // `1e3`、`0x10`、`+5` —— 那会把一条无效的坐标变成另一个数字，
+      // 于是撤回的是另一个文件。
+      const coordinate = (raw) => {
+        if (!/^(0|[1-9][0-9]*)$/.test(raw)) return undefined;
+        const parsed = Number(raw);
+        return Number.isSafeInteger(parsed) ? parsed : undefined;
+      };
+      const seq = coordinate(rawSeq);
+      const index = coordinate(rawIndex);
+      if (seq === undefined || index === undefined) return null;
       return { sessionId, seq, index };
     }
 
@@ -805,46 +1005,37 @@ window.__ModuleLoader__.load({
       const coordinates = React.useMemo(() => parseCoordinates(props.actionUrl), [props.actionUrl]);
       const line =
         coordinates === null ? undefined : `/revert --seq ${coordinates.seq} --index ${coordinates.index}`;
-      const planLine = line === undefined ? undefined : `${line} --plan`;
+      const refusalText = React.useCallback((report) => translate(refusalKeyOf(report)), [translate]);
       const { state, plan, refused, failure, run, cancel, confirm } = useRevertAction(
         coordinates?.sessionId,
         line,
-        planLine,
-        translate('dialog.noHost'),
+        refusalText,
       );
 
       if (coordinates === null) return null;
 
-      const busy = state === 'busy' || state === 'planning';
-      const dialog =
-        state === 'confirm'
-          ? h(ConfirmDialog, {
-              title: translate('dialog.file.title'),
-              body: plan ?? translate('dialog.fallback'),
-              confirmLabel: translate('dialog.confirm'),
-              cancelLabel: translate(refused ? 'dialog.close' : 'dialog.cancel'),
-              confirmHidden: refused,
-              onCancel: cancel,
-              onConfirm: confirm,
-            })
-          : null;
-
       return h(
         React.Fragment,
         null,
-        h(
-          'button',
-          {
-            type: 'button',
-            className: 'dshrvfile',
-            title: state === 'failed' ? failure ?? translate('file.failed') : translate('file.title'),
-            'aria-label': translate('file.title'),
-            disabled: busy,
-            onClick: run,
-          },
-          labelOf(state, 'file', translate),
-        ),
-        dialog,
+        h(RevertButton, {
+          state,
+          failure,
+          className: 'dshrvfile',
+          titleKey: 'file.title',
+          failureTitleKey: 'action.failed',
+          labelPrefix: 'action',
+          translate,
+          onClick: run,
+        }),
+        h(RevertConfirmDialog, {
+          state,
+          plan,
+          refused,
+          titleKey: 'dialog.file.title',
+          translate,
+          onCancel: cancel,
+          onConfirm: confirm,
+        }),
       );
     }
 
@@ -854,6 +1045,14 @@ window.__ModuleLoader__.load({
      * 把它实体化 —— 那正是宿主拒绝移除的状态。
      * 宿主已发布其 Agent 的行会被优先选择，因为临时的
      * 空白会话没有可运行该命令的 Agent。
+     *
+     * 两类行**绝不能**当承载者，否则命令会被宿主原样拒绝，
+     * 用户看到的是"没能送进承载会话"：
+     * - `origin: 'subagent'` 的行由子 Agent 路由独占，宿主的
+     *   `resolveAgent` 对它直接回 `session/agent-busy`，命令
+     *   根本到不了处理者；
+     * - `blank: true` 的行是还没发过消息的新会话占位，它没有
+     *   可运行命令的 Agent，`session.command` 只会得到未认领。
      * @param targetId - 即将被移除的会话。
      * @returns 承载会话的 id；没有任何可达会话时为 undefined。
      */
@@ -866,7 +1065,14 @@ window.__ModuleLoader__.load({
       }
       const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
       const rows = isRecord(snapshot?.byId) ? snapshot.byId : {};
-      const candidates = ids.filter((id) => typeof id === 'string' && id !== targetId);
+      /** 这一行究竟能不能承载命令：子 Agent 行与空白新会话行都不行。 */
+      const usable = (id) => {
+        const row = isRecord(rows[id]) ? rows[id] : {};
+        if (row.origin === 'subagent') return false;
+        if (row.blank === true) return false;
+        return true;
+      };
+      const candidates = ids.filter((id) => typeof id === 'string' && id !== targetId && usable(id));
       // 主视图所展示的那一行是最可靠的承载者：它持有活跃的 Agent，
       // 因此无需为了发送该命令而打开新会话。
       const rank = (id) => {
@@ -886,7 +1092,25 @@ window.__ModuleLoader__.load({
           // 没有借来绑定的行只是不算优先的承载者。
         }
       }
+      // 没有任何已发布的行能当承载者时，宁可不给承载者（卡片会说
+      // "请先打开任意一个其它会话"），也不要把命令发给一个必然被拒的会话。
       return candidates[0];
+    }
+
+    /**
+     * 列表里除了目标之外是否还有行 —— 哪怕那些行不能承载命令。
+     * 用来区分"只有这一个会话"和"有别的会话但没有一个能用"。
+     * @param targetId - 即将被移除的会话。
+     * @returns 还有其它行时为 true。
+     */
+    function hasOtherRows(targetId) {
+      try {
+        const snapshot = sessions?.list?.getSnapshot?.();
+        const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
+        return ids.some((id) => typeof id === 'string' && id !== targetId);
+      } catch {
+        return false;
+      }
     }
 
     /** 唯一一个等待用户确认的删除请求（如果有）。 */
@@ -932,7 +1156,9 @@ window.__ModuleLoader__.load({
     /**
      * 针对一个待处理删除的确认卡片。宿主自己的检查结果就是卡片正文，
      * 因此一个可能不可移除的会话 —— 它仍驻留在本次 DSH 运行中 ——
-     * 会在用户做出任何承诺之前说明这一点。
+     * 会在用户做出任何承诺之前说明这一点。宿主报告"驻留"时，
+     * 卡片改用 `--force` 重新预览：确认控件变成"强制删除"，它先把这个
+     * 会话从本次运行中卸载，再删数据。
      * @param props - 覆盖层座位提供的区域设置绑定器。
      * @returns 打开的卡片；没有待处理项时为 null。
      */
@@ -942,6 +1168,7 @@ window.__ModuleLoader__.load({
       const [phase, setPhase] = React.useState('idle');
       const [body, setBody] = React.useState(undefined);
       const [failure, setFailure] = React.useState(undefined);
+      const [force, setForce] = React.useState(false);
       const sessionId = request?.sessionId;
 
       // 每次点击一个请求对象，所以对同一个会话的第二次尝试
@@ -952,41 +1179,79 @@ window.__ModuleLoader__.load({
           setPhase('idle');
           return undefined;
         }
+        // 命令行按空白切分，所以 id 必须先通过校验才能拼进去 ——
+        // 一个异常的 id 不该悄悄改变命令的解析结果。
+        if (safeSessionId(target) === undefined) {
+          setFailure(translate('delete.badId'));
+          setPhase('failed');
+          return undefined;
+        }
         let live = true;
         setPhase('planning');
         setBody(undefined);
         setFailure(undefined);
+        setForce(false);
         const carrier = carrierFor(target);
         if (carrier === undefined) {
-          setFailure(translate('delete.noCarrier'));
+          // 没有任何可用行时，最可能是侧边栏只有这一个会话；把原因说清楚，
+          // 而不是让用户去猜"打开一个已有对话"指的是哪一个。
+          setFailure(translate(hasOtherRows(target) ? 'delete.noCarrier' : 'delete.selfOnly'));
           setPhase('failed');
           return undefined;
         }
+        /** 一条得不到检查结果的途径，各自点明原因。 */
+        const explain = (report) => {
+          if (report === undefined || report.kind === 'no-report') {
+            // 宿主认领了命令却没有回报：与"没有处理者"不同，
+            // 重试一次通常就够了。
+            setFailure(translate('delete.noHost'));
+            setPhase('failed');
+            return true;
+          }
+          if (report.kind === 'unavailable') {
+            setFailure(translate('delete.unavailable'));
+            setPhase('failed');
+            return true;
+          }
+          if (report.kind === 'unreachable') {
+            // 承载会话存在，但宿主没让命令到达处理者：多半是那个会话
+            // 还没有可用的 Agent（刚创建、从未发过消息）。
+            setFailure(translate('delete.refusedByCarrier'));
+            setPhase('failed');
+            return true;
+          }
+          return false;
+        };
+        const show = (report, forced) => {
+          const title = typeof deleteRequest?.displayTitle === 'string' ? deleteRequest.displayTitle : '';
+          setBody(`${title === '' ? '' : `会话标题：${title}\n`}${report.text ?? ''}`);
+          // 被拒绝的检查会报告 `error`；此时卡片只提供关闭。
+          setForce(forced);
+          setPhase(report.kind === 'error' ? 'refused' : 'confirm');
+        };
         requestPlan(carrier, `/${DELETE_COMMAND_NAME} --id ${target} --plan`, DELETE_COMMAND_NAME).then(
           (report) => {
             if (!live) return;
-            // 每一种得不到检查结果的途径都点明自己的原因：宿主没有
-            // 这条命令（它没被重启）、命令从未送达 Agent，
-            // 以及宿主干脆从未作答。
-            if (report === undefined) {
-              setFailure(translate('delete.noHost'));
-              setPhase('failed');
+            if (explain(report)) return;
+            // 任何被拒绝的预览都再问一次"强制删除会做什么"：
+            // 会话仍驻留时这次会成功，确认控件随之变成"强制删除"；
+            // 其它原因（布局不符、目录不在根内）照样被拒绝，
+            // 而卡片展示的仍是宿主给出的那条原因。
+            if (report.kind !== 'error') {
+              show(report, false);
               return;
             }
-            if (report.kind === 'unavailable') {
-              setFailure(translate('delete.unavailable'));
-              setPhase('failed');
-              return;
-            }
-            if (report.kind === 'unreachable') {
-              setFailure(translate('delete.unreachable'));
-              setPhase('failed');
-              return;
-            }
-            const title = typeof deleteRequest?.displayTitle === 'string' ? deleteRequest.displayTitle : '';
-            setBody(`${title === '' ? '' : `会话标题：${title}\n`}${report.text ?? ''}`);
-            // 被拒绝的检查会报告 `error`；此时卡片只提供关闭。
-            setPhase(report.kind === 'error' ? 'refused' : 'confirm');
+            requestPlan(
+              carrier,
+              `/${DELETE_COMMAND_NAME} --id ${target} --plan --force`,
+              DELETE_COMMAND_NAME,
+            ).then((forced) => {
+              if (!live) return;
+              if (explain(forced)) return;
+              // 强制预览也被拒绝时，真正的原因是普通预览给出的那条
+              // （布局不符、目录不在根内……），卡片照旧只留「关闭」。
+              show(forced.kind === 'error' ? report : forced, forced.kind !== 'error');
+            });
           },
           () => {
             if (!live) return;
@@ -1000,15 +1265,17 @@ window.__ModuleLoader__.load({
       }, [request]);
 
       const confirm = React.useCallback(() => {
-        if (sessionId === undefined) return;
-        const carrier = carrierFor(sessionId);
+        const target = safeSessionId(sessionId);
+        if (target === undefined) return;
+        const carrier = carrierFor(target);
         if (carrier === undefined) {
           setFailure(translate('delete.noCarrier'));
           setPhase('failed');
           return;
         }
         setPhase('deleting');
-        runCommand(carrier, `/${DELETE_COMMAND_NAME} --id ${sessionId}`, DELETE_COMMAND_NAME).then((outcome) => {
+        const line = `/${DELETE_COMMAND_NAME} --id ${target}${force ? ' --force' : ''}`;
+        runCommand(carrier, line, DELETE_COMMAND_NAME).then((outcome) => {
           if (outcome.status === 'done') {
             settleDeletion();
             resyncSessions();
@@ -1017,7 +1284,7 @@ window.__ModuleLoader__.load({
           setFailure(outcome.status === 'unavailable' ? translate('delete.unavailable') : outcome.text ?? translate('delete.failed'));
           setPhase('failed');
         });
-      }, [sessionId]);
+      }, [sessionId, force, translate]);
 
       if (request === null || phase === 'idle') return null;
 
@@ -1026,13 +1293,13 @@ window.__ModuleLoader__.load({
         phase === 'planning'
           ? translate('delete.planning')
           : phase === 'deleting'
-            ? translate('delete.deleting')
+            ? translate(force ? 'delete.forcing' : 'delete.deleting')
             : refusalText(phase, failure, body);
 
       return h(ConfirmDialog, {
-        title: translate('delete.title'),
+        title: translate(force ? 'delete.forceTitle' : 'delete.title'),
         body: text,
-        confirmLabel: translate('delete.confirm'),
+        confirmLabel: translate(force ? 'delete.forceConfirm' : 'delete.confirm'),
         cancelLabel: translate(refused ? 'delete.close' : 'delete.cancel'),
         // 在宿主的检查结果到达之前没有什么可确认的，而一次拒绝
         // 根本不会提供破坏性控件。
@@ -1063,7 +1330,7 @@ window.__ModuleLoader__.load({
         sessions = ctx.sessions;
         const t = ctx.locale.bind(NS);
         installStyles();
-        ctx.effect(() => ctx.locale.register(NS, { zh }), 'revert-files: dictionaries');
+        ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'revert-files: dictionaries');
         ctx.effect(() => watchRollbacks(ctx.sessions), 'revert-files: rolled-back turns');
         // 出厂的该行菜单通过这个注册表构建它的条目，
         // 这是插件添加条目的唯一途径：旧版会话菜单座位

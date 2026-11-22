@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Revert this turn's changes",
+    "description": "Restores the workspace and the conversation to their state before one Agent turn, from Git snapshots."
+  }
+}
