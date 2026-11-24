@@ -34,7 +34,7 @@
  */
 
 import crypto from 'node:crypto';
-import { rm } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 /** 本插件缺失就无法工作的服务。 */
@@ -54,33 +54,74 @@ const REF_ROOT = 'refs/dsh/revert-files';
 const GIT_PREFIX = ['--no-optional-locks', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'];
 
 /**
- * 清除继承来的仓库、配置和替换 ref 选择器，并
- * 禁用提示和缺失对象的惰性抓取。可选的索引写入
- * 已通过共享前缀里的 `--no-optional-locks` 关闭。
- * 调用方自己的 `GIT_INDEX_FILE` 覆盖在此展开之后应用。
+ * 清除继承来的仓库、配置、pathspec 与对象选择器，并禁用提示和缺失
+ * 对象的惰性抓取。可选的索引写入已通过共享前缀里的
+ * `--no-optional-locks` 关闭。调用方自己的 `GIT_INDEX_FILE` 覆盖在此
+ * 展开之后应用。
+ *
+ * 这份名单不是"把见过的都列上"，而是按**能改变哪件事**分组，因为
+ * DSH 的子进程基座只过滤敏感名与 `DSH_*`，其余环境变量原样继承：
+ *
+ * - 仓库身份（`GIT_DIR`/`GIT_WORK_TREE`/…）：会让我们 snapshot 与
+ *   restore 的不是用户以为的那个仓库。
+ * - 配置来源（`GIT_CONFIG*`）：`GIT_CONFIG_GLOBAL` 指向的文件里只要有
+ *   一个 `filter.*.smudge`，`checkout-index`/`read-tree -u` 就会执行
+ *   任意命令 —— 这是实打实的命令注入面，不只是"结果可能不对"。
+ * - pathspec 语义（`GIT_*PATHSPECS`）：`checkout-index` 自己不做 glob，
+ *   真正的危险在 `ls-files`：继承的 `GIT_GLOB_PATHSPECS` 与插件显式
+ *   设置的 `GIT_LITERAL_PATHSPECS` 同时存在时，Git 直接以
+ *   `fatal: global 'literal' pathspec setting is incompatible with all
+ *   other global pathspec settings` 失败，单文件回退从此不可用。
+ * - 对象/属性来源（`GIT_OBJECT_DIRECTORY`/`GIT_ATTR_SOURCE`/…）：会让
+ *   快照里的字节与用户工作区里的不是同一份。
+ *
+ * `GIT_EXEC_PATH` 也一并清掉：虽然内建子命令不走它，但任何经 fork/exec
+ * 的辅助程序会，没有理由把这份控制权留在外部。
  */
 const GIT_ENV = {
   ...Object.fromEntries(
     [
+      // 仓库身份
       'GIT_DIR',
       'GIT_WORK_TREE',
       'GIT_COMMON_DIR',
       'GIT_INDEX_FILE',
-      'GIT_OBJECT_DIRECTORY',
-      'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+      'GIT_NAMESPACE',
+      'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+      'GIT_CEILING_DIRECTORIES',
+      'GIT_PREFIX',
+      // 配置来源
       'GIT_CONFIG',
       'GIT_CONFIG_PARAMETERS',
       'GIT_CONFIG_COUNT',
-      'GIT_CEILING_DIRECTORIES',
-      'GIT_PREFIX',
+      'GIT_CONFIG_GLOBAL',
+      'GIT_CONFIG_SYSTEM',
+      'GIT_CONFIG_NOSYSTEM',
+      // pathspec 语义
+      'GIT_LITERAL_PATHSPECS',
+      'GIT_GLOB_PATHSPECS',
+      'GIT_NOGLOB_PATHSPECS',
+      'GIT_ICASE_PATHSPECS',
+      // 对象、属性与历史改写
+      'GIT_OBJECT_DIRECTORY',
+      'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+      'GIT_ATTR_SOURCE',
       'GIT_SHALLOW_FILE',
       'GIT_GRAFT_FILE',
       'GIT_REPLACE_REF_BASE',
-      'GIT_ATTR_SOURCE',
+      'GIT_NO_REPLACE_OBJECTS',
+      'GIT_REFERENCE_BACKEND',
+      // 外部程序
+      'GIT_EXEC_PATH',
+      'GIT_EXTERNAL_DIFF',
+      // 输出格式
+      'GIT_DIFF_OPTS',
+      'GIT_PRINT_SHA',
     ].map((key) => [key, undefined]),
   ),
   GIT_TERMINAL_PROMPT: '0',
   GIT_NO_LAZY_FETCH: '1',
+  // 环境固定为 C，路径与诊断的字节形状才可预测。
   LC_ALL: 'C',
 };
 
@@ -149,27 +190,6 @@ const refPart = (value) => {
   const digest = crypto.createHash('sha1').update(id).digest('hex').slice(0, 16);
   return `${readable === '' ? 'session' : readable}-${digest}`;
 };
-
-/**
- * 摘要化之前的组件名。更早的版本固定在其下的快照
- * 仍然可读，因此重新打开的会话不会悄悄丢失它的历史。
- *
- * 只有当 id 本身就是安全路径段时才会用它：旧命名把非 ref 字符换成
- * 下划线，于是 `a/b` 与 `a_b` 落在同一个旧命名空间里 —— 读别人的
- * 快照会让回退作用在错误的仓库状态上。当前命名带摘要，没有这个问题；
- * 这个回退只服务"id 本身就是安全段"的会话，也正是 DSH 实际产生的那种。
- */
-const legacyRefPart = (value) => {
-  const cleaned = String(value).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[.-]+/, '');
-  return cleaned === '' ? 'session' : cleaned;
-};
-
-/**
- * 某个会话是否有一个无歧义的旧命名空间。
- * @param {string} sessionId - 会话 id。
- * @returns {boolean} 旧命名空间只可能属于这个会话时为 true。
- */
-const hasUnambiguousLegacyName = (sessionId) => legacyRefPart(sessionId) === String(sessionId);
 
 /**
  * 把一个会话 id 编码成 JSONL 持久化后端据以推导其会话目录的
@@ -326,7 +346,7 @@ export function apply(ctx) {
       const sandbox = ctx.get('sandbox');
       const policy = policyFor(sessionId);
       if (sandbox !== undefined && isRecord(policy) && policy.mode !== undefined && policy.mode !== 'danger-full-access') {
-        const confined = await sandbox.confine(command, { ...policy, mode: policy.mode }, controller.signal);
+        const confined = await sandbox.confine(command, policy, controller.signal);
         if (Array.isArray(confined?.argv)) argv = confined.argv;
       }
       const child = subprocess.spawn({
@@ -365,16 +385,69 @@ export function apply(ctx) {
   };
 
   /**
-   * 运行一条必须成功的 Git 命令。
+   * 一条 Git 失败是否是"索引锁被别人占着"。
+   *
+   * 本插件的私有索引与临时索引只有它自己用，所以这里出现的锁
+   * 几乎总是自己上一次调用被超时杀掉后留下的残留物：`git` 在
+   * 持有 `<index>.lock` 时被终止，锁文件就留在 Git 目录里，之后
+   * 每一次 `add`/`read-tree` 都以 128 失败。不清掉它，那个会话的
+   * 快照与单文件回退会一直坏到进程退出 —— 而用户只看到一条警告。
+   * @param {{code: number|null, stderr: string}} result - 失败的结果。
+   * @param {Record<string, string|undefined>} env - 该次调用使用的覆盖环境。
+   * @returns {string|undefined} 要删除的锁文件路径；不是锁冲突时为 undefined。
+   */
+  const staleIndexLockOf = (result, env) => {
+    if (result.code === 0) return undefined;
+    // Git 的措辞：`Unable to create '<path>.lock': File exists.`
+    const match = /Unable to create '(.+?)': File exists/.exec(result.stderr);
+    if (match === null) return undefined;
+    const locked = match[1];
+    // 只清理本插件自己的私有/临时索引锁，绝不碰用户真实索引的锁。
+    const ours = Object.values(env).filter((value) => typeof value === 'string' && value !== '');
+    if (!ours.some((index) => locked === `${index}.lock`)) return undefined;
+    return locked;
+  };
+
+  /**
+   * 删除本插件自己留下的残留索引锁。
+   *
+   * 直接用 Node 的 `rm` 而不是 `ctx.fs.deleteFile`：这把锁在本插件自己的
+   * Git 目录里，清理它不该经过工作区沙箱策略 —— 一个因为沙箱而清不掉
+   * 的锁，会让这个会话的 Git 一直坏到进程退出。
+   * @param {string} locked - 要删除的锁文件绝对路径。
+   * @returns {Promise<boolean>} 删除成功时为 true。
+   */
+  const clearStaleIndexLock = async (locked) => {
+    try {
+      await rm(locked, { force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 运行一条必须成功的 Git 命令。撞上自己留下的残留索引锁时清掉它
+   * 再重试一次：那把锁不可能是别人持有的（私有索引只有本插件用）。
    * @param {string} sessionId - 所属会话。
    * @param {string[]} args - 共享前缀之后的参数。
    * @param {{cwd?: string, env?: Record<string, string|undefined>}} [options] - 工作目录与环境覆盖。
    * @returns {Promise<{code: number|null, stdout: string, stderr: string}>} 成功的结果。
    */
   const gitOk = async (sessionId, args, options = {}) => {
-    const result = await runGit(sessionId, args, options);
+    let result = await runGit(sessionId, args, options);
     if (result.code !== 0) {
-      throw new Error(`GIT_${args[0] ?? 'command'}_FAILED: ${firstLine(result.stderr)}`);
+      const locked = staleIndexLockOf(result, options.env ?? {});
+      if (locked !== undefined && (await clearStaleIndexLock(locked))) {
+        result = await runGit(sessionId, args, options);
+      }
+    }
+    if (result.code !== 0) {
+      // 稀疏检出的拒绝理由散在 stderr 的第二、三行，而 `firstLine` 只取
+      // 首行（"The following paths … matched paths that exist"），调用方
+      // 无从判断。这里补一个稳定的代码，让上层能把它翻译成人话。
+      const code = /outside of your sparse-checkout definition/i.test(result.stderr) ? 'SPARSE_PATHSPEC_REFUSED: ' : '';
+      throw new Error(`GIT_${args[0] ?? 'command'}_FAILED: ${code}${firstLine(result.stderr)}`);
     }
     return result;
   };
@@ -394,6 +467,12 @@ export function apply(ctx) {
     return {
       root,
       gitDir,
+      // 稀疏检出时 `git add -A` 只看得到 cone 里的路径，于是快照就只是
+      // 工作区的一个子集。回退到这样一棵树并不会丢失 cone 外的文件
+      // （`read-tree --reset -u` 不动它们），但报告不能说"已恢复到该轮
+      // 开始前"—— 那等于替一份不完整的快照作保。而且 cone 外的路径一旦
+      // 有改动，`add -A` 会直接以 128 失败，快照、预览与回退全部不可用。
+      sparse: (await runGit(sessionId, ['config', '--bool', 'core.sparseCheckout'], { cwd: root })).stdout.trim() === 'true',
       // Git 目录内的私有索引：用户自己的索引、HEAD
       // 和分支永远不会被读写。
       index: path.join(gitDir, `dsh-revert-files.index.${refPart(sessionId)}`),
@@ -441,10 +520,6 @@ export function apply(ctx) {
 
   /** @returns {string} 某一轮已固定的快照 ref。 */
   const refFor = (sessionId, turn) => `${REF_ROOT}/${refPart(sessionId)}/turn-${turn}`;
-
-  /** @returns {string|undefined} 摘要化之前组件名下的同一个 ref；旧命名有歧义时为 undefined。 */
-  const legacyRefFor = (sessionId, turn) =>
-    hasUnambiguousLegacyName(sessionId) ? `${REF_ROOT}/${legacyRefPart(sessionId)}/turn-${turn}` : undefined;
 
   /**
    * 回退前落下的反悔点。它与 `turn-…` 分开命名，因此绝不会被
@@ -520,15 +595,16 @@ export function apply(ctx) {
     if (typeof cached === 'string') return cached;
     const repo = await repoFor(sessionId);
     const generation = stateFor(sessionId).repoGeneration;
-    for (const ref of [refFor(sessionId, turn), legacyRefFor(sessionId, turn)]) {
-      if (ref === undefined) continue;
-      const result = await runGit(sessionId, ['rev-parse', '--verify', '--quiet', `${ref}^{tree}`], { cwd: repo.root });
-      if (result.code !== 0) continue;
+    const result = await runGit(sessionId, ['rev-parse', '--verify', '--quiet', `${refFor(sessionId, turn)}^{tree}`], {
+      cwd: repo.root,
+    });
+    if (result.code === 0) {
       const sha = result.stdout.trim();
-      if (sha === '') continue;
-      const state = stateFor(sessionId);
-      if (state.repoGeneration === generation) state.snapshots.set(turn, sha);
-      return sha;
+      if (sha !== '') {
+        const state = stateFor(sessionId);
+        if (state.repoGeneration === generation) state.snapshots.set(turn, sha);
+        return sha;
+      }
     }
     return undefined;
   };
@@ -536,21 +612,17 @@ export function apply(ctx) {
   /** 该会话拥有固定快照的每一轮。 */
   const snapshotTurns = async (sessionId) => {
     const repo = await repoFor(sessionId);
-    // 每个命名空间一次有界查询：ref 从不被剪除，所以列出整个
+    // 单次有界查询：ref 从不被剪除，所以列出整个
     // `REF_ROOT` 会随着每个曾在此运行过的会话增长。
     const turns = new Set();
-    const prefixes = [`${REF_ROOT}/${refPart(sessionId)}/`];
-    // 旧命名空间只有在没有歧义时才查：它不带摘要，两个只差在非 ref
-    // 字符上的会话会共用它。
-    if (hasUnambiguousLegacyName(sessionId)) prefixes.push(`${REF_ROOT}/${legacyRefPart(sessionId)}/`);
-    for (const prefix of prefixes) {
-      const result = await runGit(sessionId, ['for-each-ref', '--format=%(refname)', prefix], { cwd: repo.root });
-      if (result.code !== 0) continue;
+    const prefix = `${REF_ROOT}/${refPart(sessionId)}/`;
+    const result = await runGit(sessionId, ['for-each-ref', '--format=%(refname)', prefix], { cwd: repo.root });
+    if (result.code === 0) {
       for (const line of result.stdout.split(/\r?\n/)) {
         const name = line.trim();
         if (!name.startsWith(prefix)) continue;
         const turn = Number(name.slice(prefix.length).replace(/^turn-/, ''));
-        if (Number.isSafeInteger(turn) && turn > 0) turns.add(turn);
+        if (isPositiveTurn(turn)) turns.add(turn);
       }
     }
     return [...turns].sort((left, right) => left - right);
@@ -644,6 +716,51 @@ export function apply(ctx) {
   };
 
   /**
+   * 回退会连带删掉哪些被 Git 忽略的文件。
+   *
+   * README 与工具说明承诺"Git 忽略的路径在恢复时不会被删除"，这条在
+   * 通常情形下成立 —— 忽略文件根本不进私有索引，`read-tree --reset -u`
+   * 看不见它们。但当某个被跟踪的**文件**在这一轮被换成了同名**目录**
+   * （典型形态就是构建产物目录：`dist` 从文件变成 `dist/…`），恢复要把
+   * 它写回成文件，就必须先清掉那个目录，于是目录里被忽略的内容一起没了
+   * —— 那些字节既不在快照里，也无处可恢复。
+   *
+   * 这里只做**报告**，不改变恢复行为：那些文件确实挡在恢复目标的位置上。
+   * 让用户在确认卡片上看见它们，比悄悄删掉要好。
+   * @param {string} sessionId - 所属会话。
+   * @param {object} repo - 已解析的仓库。
+   * @param {Array<{status: string, path: string}>} changed - 已算出的改动路径。
+   * @returns {Promise<string[]>} 会被连带删除的忽略文件，已排序。
+   */
+  const ignoredCasualtiesOf = async (sessionId, repo, changed) => {
+    // 只有"恢复要把某个路径写回成文件"的那些路径才可能连带删东西：
+    // 它们在快照里，而工作区里同名的位置已经不是文件。
+    const restoring = changed.filter((item) => item.status === 'M' || item.status === 'D');
+    if (restoring.length === 0) return [];
+    const casualties = [];
+    for (const item of restoring) {
+      // 该路径在工作区里是目录时，忽略文件才可能藏在它下面。
+      let isDirectory = false;
+      try {
+        isDirectory = (await stat(path.resolve(repo.root, item.path))).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDirectory) continue;
+      const listed = await runGit(
+        sessionId,
+        ['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', item.path],
+        { cwd: repo.root, env: { GIT_LITERAL_PATHSPECS: '1' } },
+      );
+      if (listed.code !== 0) continue;
+      for (const entry of listed.stdout.split('\u0000')) {
+        if (entry !== '') casualties.push(entry);
+      }
+    }
+    return [...new Set(casualties)].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  };
+
+  /**
    * 把当前工作区固定成一个反悔点。此时私有索引已经刷新到工作区，
    * 所以 `write-tree` 得到的就是"这次回退即将覆盖掉的状态"。
    * @param {string} sessionId - 所属会话。
@@ -678,26 +795,30 @@ export function apply(ctx) {
    * "现在"固定成反悔点 —— 那才是这次回退真正覆盖掉的状态。
    * @param {string} sessionId - 所属会话。
    * @param {string} tree - 目标 tree。
-   * @returns {Promise<{changed: object[], repo: object, undo: number|undefined}>} 结果。
+   * @returns {Promise<{changed: object[], repo: object, undo: number|undefined, casualties: string[]}>} 结果。
    */
   const restoreTree = async (sessionId, tree) => {
     const repo = await repoFor(sessionId);
     // 这次调用会刷新私有索引；随后 write-tree 就得到当前工作区的树。
     const changed = await changedPaths(sessionId, repo, tree);
+    // 必须在 read-tree 之前问：之后工作区就已经被改写，目录也没了。
+    const casualties = await ignoredCasualtiesOf(sessionId, repo, changed).catch(() => []);
     // 反悔点是尽力而为的：它失败绝不能挡下回退本身。
     const undo = await pinUndo(sessionId, repo).catch(() => undefined);
     const env = { GIT_INDEX_FILE: repo.index };
     // 把刷新后的索引与快照做双向合并：该轮触碰过的每个路径
     // 都会被写回，而该轮新建的路径会被删除。
     await gitOk(sessionId, ['read-tree', '--reset', '-u', tree], { cwd: repo.root, env });
-    return { changed, repo, undo };
+    return { changed, repo, undo, casualties };
   };
 
   /**
    * 只从某一棵快照树恢复指定的工作区路径。
    * @param {string} sessionId - 所属会话。
    * @param {string} tree - 持有改动前字节的快照树。
-   * @param {Array<{relPath: string, displayPath: string, remove: () => Promise<void>}>} items - 解析出的目标。
+   * @param {Array<{relPath: string, displayPath: string, present?: boolean, remove: () => Promise<void>}>} items -
+   *   解析出的目标。`present` 是调用方已经问过的"该路径在快照树里吗"的答案；
+   *   给出时不再重复探测。
    * @returns {Promise<{reverted: object[], skipped: object[]}>} 每个路径的结果。
    */
   const restorePaths = async (sessionId, tree, items) => {
@@ -708,8 +829,11 @@ export function apply(ctx) {
     const skipped = [];
     for (const item of items) {
       try {
-        const present = await runGit(sessionId, ['cat-file', '-e', `${tree}:${item.relPath}`], { cwd: repo.root });
-        if (present.code === 0) {
+        const present =
+          typeof item.present === 'boolean'
+            ? item.present
+            : (await runGit(sessionId, ['cat-file', '-e', `${tree}:${item.relPath}`], { cwd: repo.root })).code === 0;
+        if (present) {
           // 二进制安全：blob 直接写入文件，绝不经过文本。
           await gitOk(sessionId, ['checkout-index', '-f', '--', item.relPath], { cwd: repo.root, env: scratch });
           reverted.push({ path: item.displayPath, action: 'restored' });
@@ -824,11 +948,74 @@ export function apply(ctx) {
    * @param {number} turn - 要隐藏的第一个轮次。
    * @returns {Promise<object>} 发生了什么，供报告使用。
    */
+  /**
+   * 日志里是否还有一轮没结束。
+   *
+   * `state.running` 只由本进程看到的实时 `turn/start` 置位，所以插件在
+   * 轮次进行中被加载（HMR，或 agent resume 之后再 `apply()`）时，它以为
+   * 会话是空闲的 —— 于是表层的 `busy` 守卫形同虚设，替换会写在一条
+   * 活着的循环脚下。日志是唯一的权威：最后一条 `turn/start` 之后如果
+   * 没有与之配对的 `turn/end`，那一轮就还在跑。
+   * @param {any} session - 实时会话。
+   * @returns {boolean} 仍有一轮未结束时为 true。
+   */
+  const logHasOpenTurn = (session) => {
+    if (typeof session?.snapshotEvents !== 'function') return false;
+    let events;
+    try {
+      events = session.snapshotEvents();
+    } catch {
+      // 读不到日志时不做断言：谎报"忙"会挡住合理的回退。
+      return false;
+    }
+    if (!Array.isArray(events)) return false;
+    let open = 0;
+    for (const event of events) {
+      if (event?.type === 'turn/start') open += 1;
+      else if (event?.type === 'turn/end') open -= 1;
+    }
+    return open > 0;
+  };
+
+  /**
+   * 隐藏范围的最后一个轮次。
+   *
+   * 遮蔽的是从 `turn` 到表层末尾的整段，所以上界必须是"对话实际推进到
+   * 了哪里"，而不是"哪一轮成功地落下了快照"。用后者会让中间几轮快照
+   * 失败（竞态、稀疏检出的拒绝、残留锁）之后的回退低估范围：模型历史
+   * 已经不含那几轮，聊天里却还显示着 —— 与上限截断的方向正好相反。
+   * @param {string} sessionId - 所属会话。
+   * @param {any} session - 实时会话。
+   * @param {number} turn - 起算轮次。
+   * @returns {Promise<number>} 被隐藏的最后一个轮次。
+   */
+  const lastHiddenTurn = async (sessionId, session, turn) => {
+    const state = stateFor(sessionId);
+    let latest = Math.max(turn, state.turn);
+    // 日志里出现过的最大轮次：它不是"快照存在"，而是"这一轮真的跑过"。
+    try {
+      const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : [];
+      for (const event of Array.isArray(events) ? events : []) {
+        const value = event?.data?.turn;
+        if (isPositiveTurn(value) && value > latest) latest = value;
+      }
+    } catch {
+      // 日志不可读时退回已知的轮次。
+    }
+    // 已固定的快照是对话推进到哪里的持久记录；会话重新打开后
+    // `state.turn` 是 0，这份记录是唯一还剩的线索。
+    for (const pinned of await snapshotTurns(sessionId).catch(() => [])) {
+      if (pinned > latest) latest = pinned;
+    }
+    return Math.min(latest, turn + MAX_HIDDEN_TURNS - 1);
+  };
+
   const revertConversation = async (sessionId, turn) => {
     const session = ctx.get('sessions')?.get(sessionId);
     if (session === undefined || typeof session.append !== 'function') return { kind: 'unavailable' };
     const state = stateFor(sessionId);
-    if (state.running) return { kind: 'busy' };
+    // 实时事件与日志取或：前者在插件晚加载时是空的，后者才是权威。
+    if (state.running || logHasOpenTurn(session)) return { kind: 'busy' };
     const nodes = Array.isArray(session.surface?.nodes) ? [...session.surface.nodes] : [];
     if (nodes.length === 0) return { kind: 'empty' };
     // 表层的尾部是本插件自己更早的检查点，它
@@ -856,10 +1043,9 @@ export function apply(ctx) {
     // 行；已固定的快照轮次是对话进展到哪里的持久记录。
     // 手动折叠可以避免拥有极多固定 ref 的会话
     // 撑爆一次展开调用。
-    const turns = await snapshotTurns(sessionId).catch(() => []);
-    let latest = Math.max(turn, state.turn);
-    for (const pinned of turns) if (pinned > latest) latest = pinned;
-    const to = Math.min(latest, turn + MAX_HIDDEN_TURNS - 1);
+    // 浏览器半边需要最后一个被隐藏的轮次来隐藏同样的记录行；
+    // 它取自对话实际推进到的位置，而不是"哪一轮有快照"。
+    const to = await lastHiddenTurn(sessionId, session, turn);
     try {
       session.append(
         CONVERSATION_EVENT_TYPE,
@@ -987,14 +1173,16 @@ export function apply(ctx) {
     // 在会话重新打开后仍可能被回退。
     void state.repoPromise
       ?.then(async (repo) => {
-        // 更名之后，摘要化之前的索引名已死：没有东西会读它。
-        const retired = path.join(repo.gitDir, `dsh-revert-files.index.${legacyRefPart(sessionId)}`);
-        for (const scratch of [repo.index, `${repo.index}.one`, retired]) {
-          try {
-            const target = await ctx.fs.resolve(scratch, { cwd: repo.root });
-            await ctx.fs.deleteFile(target, undefined, undefined, policyFor(sessionId));
-          } catch {
-            // 遗留的索引是无害的，而且位于 Git 目录内。
+        // 索引、它的临时索引，以及两者可能残留的 `.lock`：只清索引而
+        // 留下锁文件，会让下一个使用同一会话 id 的进程立刻撞上它。
+        for (const scratch of [repo.index, `${repo.index}.one`]) {
+          for (const leftover of [scratch, `${scratch}.lock`]) {
+            try {
+              const target = await ctx.fs.resolve(leftover, { cwd: repo.root });
+              await ctx.fs.deleteFile(target, undefined, undefined, policyFor(sessionId));
+            } catch {
+              // 遗留的索引与锁都是无害的，而且位于 Git 目录内。
+            }
           }
         }
       })
@@ -1080,8 +1268,23 @@ export function apply(ctx) {
   /** 每个调用方传入的都是已校验的正数轮次。 */
   const describeTurn = (turn) => `第 ${turn} 轮`;
 
+  /** 工作区不是 Git 仓库时的统一文案。 */
+  const NOT_A_REPOSITORY_MESSAGE = '当前工作区不是 Git 仓库，无法使用基于 Git 的文件追踪。';
+
+  /**
+   * 稀疏检出里 cone 外路径有改动时的说明。
+   *
+   * 这不是本插件的 bug，而是稀疏检出的语义：`git add -A` 拒绝把 cone 外的
+   * 路径写进索引，于是快照根本建立不起来。用户能做的是把那个路径纳入
+   * cone、或者先提交/还原它的改动，所以文案要说清这两条路。
+   */
+  const SPARSE_DIRTY_MESSAGE =
+    '该仓库启用了稀疏检出，而 sparse-checkout 范围外的路径有未提交的改动，' +
+    'Git 拒绝在这种情况下建立快照，因此无法回退。' +
+    '可以先处理那些改动（提交或还原），或把它们纳入 sparse-checkout 范围后再试。';
+
   /** 某一轮没有快照时的报告；预览与执行说的是同一句话。 */
-  const noSnapshotMessage = (turn) => `第 ${describeTurn(turn)}没有可用的快照，无法回退。`;
+  const noSnapshotMessage = (turn) => `${describeTurn(turn)}没有可用的快照，无法回退。`;
 
   /** 这个会话一个快照都没有时的报告。 */
   const NO_SNAPSHOT_MESSAGE =
@@ -1207,6 +1410,47 @@ export function apply(ctx) {
   };
 
   /**
+   * 报告回退会连带删掉的被忽略文件。
+   *
+   * 这些文件挡在恢复目标的位置上（一个被跟踪文件要从目录变回文件），
+   * 所以它们会被删掉，而且不在快照里 —— 删了就是没了。预览与执行
+   * 说同一句话，用户才能在点确认之前看见代价。
+   * @param {string[]} casualties - `ignoredCasualtiesOf` 的结果。
+   * @param {'plan'|'done'} mode - 尚未发生还是已经发生。
+   * @returns {string[]} 这些行；没有时为空。
+   */
+  const describeCasualties = (casualties, mode) => {
+    if (!Array.isArray(casualties) || casualties.length === 0) return [];
+    const verb = mode === 'plan' ? '会一并删除' : '已一并删除';
+    const lines = [`⚠ 以下被 Git 忽略的文件${verb}（它们不在快照里，无法恢复）：`];
+    for (const item of casualties.slice(0, MAX_LISTED_FILES)) lines.push(`  ${item}`);
+    if (casualties.length > MAX_LISTED_FILES) {
+      lines.push(`  …另有 ${casualties.length - MAX_LISTED_FILES} 个未列出。`);
+    }
+    return lines;
+  };
+
+  /**
+   * 报告稀疏检出给这次回退划定的范围。
+   *
+   * `git add -A` 在稀疏检出里只看得到 cone 内的路径，所以快照只是工作区
+   * 的一个子集。恢复那棵树**不会**删掉 cone 外的文件（`read-tree` 不动
+   * 它们），但也不能声称"已恢复到该轮开始前"—— cone 外的改动根本没被
+   * 记录，也就无从回退。把范围说清楚，比给一个听起来完整的结论要诚实。
+   * @param {object} repo - 已解析的仓库。
+   * @param {'plan'|'done'} mode - 尚未发生还是已经发生。
+   * @returns {string[]} 这些行；不是稀疏检出时为空。
+   */
+  const describeSparseScope = (repo, mode) => {
+    if (repo?.sparse !== true) return [];
+    const what = mode === 'plan' ? '这次回退只覆盖' : '这次回退只覆盖了';
+    return [
+      `注意：该仓库启用了稀疏检出，${what} sparse-checkout 范围内的文件；` +
+        '范围外路径的改动不在快照里，也没有被回退。',
+    ];
+  };
+
+  /**
    * 描述一次回退而不实际执行：它会恢复哪些文件，
    * 以及对话会随之一起被滚回。
    * @param {string} sessionId - 所属会话。
@@ -1221,9 +1465,11 @@ export function apply(ctx) {
         return { kind: 'error', text: `反悔点 ${request.undo} 不存在或已被清理。` };
       }
       const changed = await changedPaths(sessionId, repo, tree);
+      const casualties = await ignoredCasualtiesOf(sessionId, repo, changed).catch(() => []);
       const lines = [`反悔会把工作区恢复到反悔点 ${request.undo} 记录的状态：`];
       if (changed.length === 0) lines.push('  工作区与反悔点一致，没有需要恢复的改动。');
       else lines.push(...describeFileLines(changed, 'plan'));
+      lines.push(...describeCasualties(casualties, 'plan'));
       return { kind: 'success', text: lines.join('\n') };
     }
     if (Number.isSafeInteger(request.seq) && Number.isSafeInteger(request.index)) {
@@ -1261,6 +1507,7 @@ export function apply(ctx) {
       return { kind: 'error', text: noSnapshotMessage(resolved) };
     }
     const changed = await changedPaths(sessionId, repo, tree);
+    const casualties = await ignoredCasualtiesOf(sessionId, repo, changed).catch(() => []);
     const lines = [];
     if (changed.length === 0) {
       lines.push(`${describeTurn(resolved)}没有需要恢复的文件改动。`);
@@ -1268,6 +1515,8 @@ export function apply(ctx) {
       lines.push(`撤回会把这些文件退回${describeTurn(resolved)}开始前的状态：`);
       lines.push(...describeFileLines(changed, 'plan'));
     }
+    lines.push(...describeCasualties(casualties, 'plan'));
+    lines.push(...describeSparseScope(repo, 'plan'));
     lines.push('同时会撤回这一轮开始的对话内容，且这一步不可撤销。');
     return { kind: 'success', text: lines.join('\n') };
   };
@@ -1278,9 +1527,7 @@ export function apply(ctx) {
       repo = await repoFor(sessionId);
     } catch (error) {
       const reason = errorCode(error);
-      return reason.startsWith('NOT_A_GIT_REPOSITORY')
-        ? '当前工作区不是 Git 仓库，无法使用基于 Git 的文件追踪。'
-        : `无法使用 Git：${reason}。`;
+      return reason.startsWith('NOT_A_GIT_REPOSITORY') ? NOT_A_REPOSITORY_MESSAGE : `无法使用 Git：${reason}。`;
     }
     const turns = await snapshotTurns(sessionId);
     if (turns.length === 0) {
@@ -1327,6 +1574,8 @@ export function apply(ctx) {
   const restoreReportBody = (result) => {
     const lines = [`  ${describeCounts(result.changed)}`];
     if (result.changed.length > 0) lines.push(...describeFileLines(result.changed, 'done'));
+    lines.push(...describeCasualties(result.casualties, 'done'));
+    lines.push(...describeSparseScope(result.repo, 'done'));
     return lines;
   };
 
@@ -1411,6 +1660,8 @@ export function apply(ctx) {
       items.push({
         relPath: located.sourceRelPath,
         displayPath: located.sourceRelPath,
+        // 重命名来源只在 `cat-file -e` 失败时才被识别出来，所以它在快照里。
+        present: true,
         remove: async () => {
           const target = await ctx.fs.resolve(path.resolve(repo.root, located.sourceRelPath));
           await ctx.fs.deleteFile(target, undefined, undefined, policyFor(sessionId));
@@ -1420,6 +1671,8 @@ export function apply(ctx) {
     items.push({
       relPath: located.relPath,
       displayPath: located.displayPath,
+      // `locateFile` 已经问过这件事，预览也用的是同一个答案。
+      present: located.presentInTree,
       remove: async () => {
         await ctx.fs.deleteFile(located.target, undefined, undefined, policyFor(sessionId));
       },
@@ -1456,11 +1709,14 @@ export function apply(ctx) {
       });
     } catch (error) {
       const reason = errorCode(error);
+      // 稀疏检出里 cone 外的路径一有改动，`add -A` 就以 128 失败。原文对
+      // 用户毫无意义，换成一条能照着做的说明；其余失败照旧透传诊断。
+      if (reason.includes('SPARSE_PATHSPEC_REFUSED')) {
+        return { kind: 'error', text: SPARSE_DIRTY_MESSAGE };
+      }
       return {
         kind: 'error',
-        text: reason.startsWith('NOT_A_GIT_REPOSITORY')
-          ? '当前工作区不是 Git 仓库，无法使用基于 Git 的文件追踪。'
-          : `回退失败：${reason}`,
+        text: reason.startsWith('NOT_A_GIT_REPOSITORY') ? NOT_A_REPOSITORY_MESSAGE : `回退失败：${reason}`,
       };
     }
   };
@@ -1484,7 +1740,7 @@ export function apply(ctx) {
     const toolName = isRecord(exec) ? exec.name : undefined;
     const request = isRecord(exec) && isRecord(exec.arguments) ? exec.arguments : {};
     if (toolName !== TOOL_NAME || request.action !== 'revert') return typeof next === 'function' ? next() : { kind: 'allow' };
-    const turn = Number.isSafeInteger(request.turn) && request.turn > 0 ? request.turn : undefined;
+    const turn = isPositiveTurn(request.turn) ? request.turn : undefined;
     // 一个拼错的轮次会被 `execute` 直接拒绝、什么也不改；先弹一次
     // 审批只会让用户习惯于不看内容就点同意。
     if (request.turn !== undefined && turn === undefined) return typeof next === 'function' ? next() : { kind: 'allow' };
@@ -1506,7 +1762,8 @@ export function apply(ctx) {
       'A whole-turn revert also rolls the conversation back: that turn and everything after it stop reaching the model and are hidden in the transcript. ' +
       'Call it with action "list" to see which turns have snapshots and what differs, or action "plan" to see exactly which files one revert would restore, then action "revert" with a turn number. ' +
       'The whole worktree is restored: files the turn modified or deleted come back, and files the turn created are removed. ' +
-      'Gitignored paths are outside the snapshot in both directions. Reverting is destructive to every later change, so revert only the turns the user asked to undo; ' +
+      'Gitignored paths are outside the snapshot, and a revert normally leaves them alone — except when a tracked file was replaced by a directory of the same name: restoring the file means clearing that directory, which deletes the ignored content inside it irrecoverably. The plan reports those paths so the user can see them first. ' +
+      'Reverting is destructive to every later change, so revert only the turns the user asked to undo; ' +
       'action "revert" asks the user for approval first, and the denial is an ordinary tool error.',
     parameters: {
       type: 'object',
@@ -1542,7 +1799,7 @@ export function apply(ctx) {
       }
       // 命令通道对 `--turn 0`/`--turn abc` 直接报错，工具通道必须
       // 同样严格：一个拼错的轮次会被当成"当前轮"，而回退不可撤销。
-      if (input.turn !== undefined && (!Number.isSafeInteger(input.turn) || input.turn <= 0)) {
+      if (input.turn !== undefined && !isPositiveTurn(input.turn)) {
         return { text: 'turn 必须是大于 0 的整数；省略它才会使用最新的一轮。' };
       }
       const turn = input.turn;
@@ -1896,9 +2153,10 @@ export function apply(ctx) {
     if (inspection.directory !== undefined) await rm(inspection.directory, { recursive: true, force: true });
     for (const checkpoint of inspection.cachePaths) await rm(checkpoint, { force: true });
     await forgetSession(inspection);
-    // 随附的浏览器半边在此事件上移除一行，宿主会把它转发给
-    // 每个已连接的浏览器半边。持久层不再列出该会话，所以
-    // 下一次列表基线无法把这行带回来。
+    // 宿主广播的出厂事件。本插件自己的浏览器半边并不监听它 —— 那条
+    // 菜单路径已经自己调用了 `sessions.refresh()`，这里发事件只是让
+    // 其他监听者（以及将来的实现）也能知道这一行没了。持久层不再
+    // 列出该会话，所以下一次列表基线也无法把这行带回来。
     ctx.emit('api-session/removed', sessionId);
     return { inspection, evicted };
   };

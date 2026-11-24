@@ -13,6 +13,7 @@
  * 插件追加的事件。除文档化的缝隙外，不涉及任何 DSH 服务。
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -35,8 +36,16 @@ if (gitPath === '') {
 }
 
 /** 运行一条初始化期的 Git 命令，非零退出时大声报错。 */
+/**
+ * 运行一条初始化期的 Git 命令，非零退出时大声报错。
+ *
+ * 固定用一份干净环境：某些夹具会临时设 `GIT_DIR` 之类的变量来模拟
+ * "被继承的敌意环境"，而这个辅助函数是**测试自己**在看仓库，不该被
+ * 那些变量重定向 —— 否则它会去看另一个仓库，然后报告"快照没建立"。
+ */
+const GIT_PROBE_ENV = { PATH: process.env.PATH, HOME: process.env.HOME, LC_ALL: 'C' };
 const git = (args, cwd) => {
-  const outcome = spawnSync(gitPath, args, { cwd, encoding: 'utf8' });
+  const outcome = spawnSync(gitPath, args, { cwd, encoding: 'utf8', env: GIT_PROBE_ENV });
   if (outcome.status !== 0) throw new Error(`git ${args.join(' ')}: ${outcome.stderr.trim()}`);
   return outcome.stdout;
 };
@@ -141,6 +150,97 @@ const fakeRegistry = (sessionId, cleanup, labelIt = true) => {
 };
 
 /**
+ * 插件的会话命名（与 `index.js` 的 `refPart` 同规则）。
+ *
+ * 多个夹具需要自己算出插件会用的 ref/索引名。直接抄一份实现是错的：
+ * 源码还会折叠 `..`、去掉开头的 `.-` 与结尾的 `.`，少了任何一条，
+ * 含这类字符的会话 id 就会让测试去找一个不存在的名字 —— 而测试依然
+ * 通过，因为它断言的是自己算出来的那个错名字。规则只能有一份。
+ * @param {unknown} value - 会话 id。
+ * @returns {string} 该 id 的 ref/索引名组件。
+ */
+const refPart = (value) => {
+  const id = String(value);
+  const readable = id
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .replace(/\.{2,}/g, '_')
+    .replace(/^[.-]+/, '')
+    .slice(0, 24)
+    .replace(/\.+$/, '');
+  const digest = createHash('sha1').update(id).digest('hex').slice(0, 16);
+  return `${readable === '' ? 'session' : readable}-${digest}`;
+};
+
+/**
+ * 一个刚 `git init` 好的临时仓库，可选的初始文件已经写完并 `add` 过。
+ *
+ * 每个夹具都以"空仓库 + 一点初始内容"开头，差别只在种子文件和前缀。
+ * 种子内容全为空就不 `add` —— 空仓库的 `git add -A` 什么也不做。
+ * @param {{prefix: string, seed?: Record<string, string>}} options -
+ *   `mkdtemp` 前缀（让失败信息能指出是哪个夹具）与相对路径到内容的映射。
+ * @returns {string} 仓库根目录。
+ */
+const seedRepo = ({ prefix, seed = {} }) => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  git(['init', '-q'], repo);
+  for (const [relative, contents] of Object.entries(seed)) {
+    const target = path.join(repo, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, contents);
+  }
+  if (Object.keys(seed).length > 0) git(['add', '-A'], repo);
+  return repo;
+};
+
+/**
+ * 每个夹具都要的那个假会话：一个以 seq 为下标的日志、一个可写的表层，
+ * 以及插件读取的同步日志访问器。
+ *
+ * 三个变体都由 `mode` 决定，这正是各夹具本来就在手写的差别：
+ * - `'record'`（默认）—— 追加进日志并放进 `appended`，供断言检查插件写了什么；
+ * - `'throw'` —— 任何追加都直接失败，用于"这条路径不该碰对话"的断言；
+ * - `'plain'` —— 追加进日志但不记录，用于只关心日志形状的夹具。
+ * @param {{sessionId: string, cwd: string, mode?: 'record'|'throw'|'plain', message?: string}} options -
+ *   会话 id、工作目录、追加行为，以及 `'throw'` 时抛出的文案。
+ * @returns {{session: any, log: any[], appended: any[], push: (event: any) => any}} 会话及其日志。
+ */
+const fakeSession = ({ sessionId, cwd, mode = 'record', message = 'this harness never appends to the log' }) => {
+  /** @type {any[]} */
+  const log = [];
+  /** @type {any[]} */
+  const appended = [];
+  const push = (event) => {
+    log[event.seq] = event;
+    return event;
+  };
+  const append = {
+    record(type, data, opts) {
+      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
+      push(event);
+      appended.push(event);
+      return event;
+    },
+    plain(type, data, opts) {
+      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
+      log.push(event);
+      return event;
+    },
+    throw() {
+      throw new Error(message);
+    },
+  }[mode];
+  const session = {
+    id: sessionId,
+    header: { cwd },
+    surface: { nodes: [] },
+    eventAt: (seq) => log[seq],
+    snapshotEvents: () => log,
+    append,
+  };
+  return { session, log, appended, push };
+};
+
+/**
  * 同样的缝隙，但在每个子进程退出后加一个固定延迟：它拓宽了两个重叠请求
  * 交错执行各自 Git 调用的窗口，而这正是会话锁必须封住的窗口。
  */
@@ -175,6 +275,7 @@ const waitForTurnRef = async (repo, turn, warnings = [], timeoutMs = 20_000) => 
     const probe = spawnSync(gitPath, ['for-each-ref', '--format=%(refname)', 'refs/dsh/revert-files'], {
       cwd: repo,
       encoding: 'utf8',
+      env: GIT_PROBE_ENV,
     });
     const ref = probe.stdout
       .split('\n')
@@ -204,33 +305,10 @@ const LAYOUTS = [
  * @returns {Promise<{checkpoint: any, shadowed: number[], boundary: number, repo: string}>}
  */
 const revertOnce = async (layout) => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-revert-host-'));
   const sessionId = 'session-host-test';
-  git(['init', '-q'], repo);
-  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'before\n');
-  git(['add', '-A'], repo);
+  const repo = seedRepo({ prefix: 'dsh-revert-host-', seed: { 'tracked.txt': 'before\n' } });
 
-  /** @type {any[]} */
-  const log = [];
-  /** @type {any[]} */
-  const appended = [];
-  const push = (event) => {
-    log[event.seq] = event;
-    return event;
-  };
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append(type, data, opts) {
-      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
-      push(event);
-      appended.push(event);
-      return event;
-    },
-  };
+  const { session, log, appended, push } = fakeSession({ sessionId, cwd: repo });
   const emit = (event) => {
     push(event);
     handlers.get('session/event')(session, event);
@@ -318,25 +396,11 @@ for (const { label, checkpoint, shadowed, boundary, repo, outcome, leftover, war
  * @returns {Promise<object>} 观察到的缝隙行为。
  */
 const seamsOnce = async () => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-revert-seams-'));
   const sessionId = 'session-seams';
-  git(['init', '-q'], repo);
-  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'before\n');
-  git(['add', '-A'], repo);
+  const repo = seedRepo({ prefix: 'dsh-revert-seams-', seed: { 'tracked.txt': 'before\n' } });
   const seedTree = git(['write-tree'], repo).trim();
 
-  /** @type {any[]} */
-  const log = [];
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append() {
-      throw new Error('the seam harness never appends to the log');
-    },
-  };
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'throw', message: 'the seam harness never appends to the log' });
   const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
   apply(ctx);
 
@@ -366,8 +430,9 @@ const seamsOnce = async () => {
   const fileAfter = fs.readFileSync(path.join(repo, 'tracked.txt'), 'utf8');
   const refusedSeq = await asAgent('--seq 1');
 
-  // 早期构建用摘要之前的名称固定的快照仍然可以访问到。
-  git(['update-ref', `refs/dsh/revert-files/${sessionId}/turn-9`, seedTree], repo);
+  // 另一个会话在这个仓库里留下的快照，或者一个不属于本会话命名空间的
+  // ref，都不得出现在本会话的列表里。
+  git(['update-ref', 'refs/dsh/revert-files/some-other-session/turn-9', seedTree], repo);
   const listText = (await asAgent('--list')).text ?? '';
 
   fs.rmSync(repo, { recursive: true, force: true });
@@ -393,18 +458,7 @@ const coordinateOnce = async () => {
   fs.writeFileSync(path.join(repo, 'keep.txt'), 'keep\n');
   git(['add', '-A'], repo);
 
-  /** @type {any[]} */
-  const log = [];
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append() {
-      throw new Error('a single-file revert never touches the conversation');
-    },
-  };
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'throw', message: 'a single-file revert never touches the conversation' });
   // 审查标签页自己的摘要。`path` 在工作目录内部时相对于 cwd，
   // 在外部时是绝对路径，而 `display` 是 Host 对同一文件的
   // 面向人的呈现。
@@ -488,18 +542,7 @@ const raceOnce = async () => {
   fs.writeFileSync(fileA, 'a1\n');
   git(['add', '-A'], repo);
 
-  /** @type {any[]} */
-  const log = [];
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append() {
-      throw new Error('the race harness never touches the conversation');
-    },
-  };
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'throw', message: 'the race harness never touches the conversation' });
   // 两条变更记录，各指名某一轮的某一个文件。
   const SEQ_A = 4;
   const SEQ_B = 6;
@@ -564,27 +607,7 @@ const cwdSwitchOnce = async () => {
     git(['add', '-A'], repo);
   }
 
-  /** @type {any[]} */
-  const log = [];
-  /** @type {any[]} */
-  const appended = [];
-  const push = (event) => {
-    log[event.seq] = event;
-    return event;
-  };
-  const session = {
-    id: sessionId,
-    header: { cwd: repoA },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append(type, data, opts) {
-      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
-      push(event);
-      appended.push(event);
-      return event;
-    },
-  };
+  const { session, log, appended, push } = fakeSession({ sessionId, cwd: repoA });
   const emit = (event) => {
     push(event);
     handlers.get('session/event')(session, event);
@@ -636,33 +659,10 @@ const cwdSwitchOnce = async () => {
  * @returns {Promise<object>} 报告、文件结果以及追加的日志。
  */
 const headOnlyOnce = async () => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-revert-head-'));
   const sessionId = 'session-head-only';
-  git(['init', '-q'], repo);
-  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'before\n');
-  git(['add', '-A'], repo);
+  const repo = seedRepo({ prefix: 'dsh-revert-head-', seed: { 'tracked.txt': 'before\n' } });
 
-  /** @type {any[]} */
-  const log = [];
-  /** @type {any[]} */
-  const appended = [];
-  const push = (event) => {
-    log[event.seq] = event;
-    return event;
-  };
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append(type, data, opts) {
-      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
-      push(event);
-      appended.push(event);
-      return event;
-    },
-  };
+  const { session, log, appended, push } = fakeSession({ sessionId, cwd: repo });
   const emit = (event) => {
     push(event);
     handlers.get('session/event')(session, event);
@@ -724,7 +724,7 @@ await harness('the seams harness', seamsOnce, (seams) => {
   check('a bad --turn is refused', seams.refusedTurn?.kind === 'error', JSON.stringify(seams.refusedTurn));
   check('a refused revert changes nothing', seams.fileAfter === 'after\n', JSON.stringify(seams.fileAfter));
   check('--seq without --index is refused', seams.refusedSeq?.kind === 'error', JSON.stringify(seams.refusedSeq));
-  check('a pre-digest snapshot ref is still listed', seams.listText.includes('第 9 轮'), seams.listText);
+  check("another session's ref stays out of the list", !seams.listText.includes('第 9 轮'), seams.listText);
   check('the seams harness logged no snapshot warning', seams.warnings.length === 0, JSON.stringify(seams.warnings));
 });
 
@@ -742,7 +742,8 @@ await harness('the working-directory harness', cwdSwitchOnce, (switched) => {
   check('the revert leaves the old repository alone', switched.aKept === 'a\n', JSON.stringify(switched.aKept));
   check(
     'an old turn is reported as having no snapshot here',
-    switched.stale?.kind === 'error' && String(switched.stale.text).includes('没有可用的快照'),
+    // 整句断言：只查子串会让「第 第 1 轮」这类重复措辞溜过去。
+    switched.stale?.kind === 'error' && switched.stale.text === '第 1 轮没有可用的快照，无法回退。',
     JSON.stringify(switched.stale),
   );
   check('the working-directory harness logged no snapshot warning', switched.warnings.length === 0, JSON.stringify(switched.warnings));
@@ -1122,18 +1123,7 @@ const sameRepoMoveOnce = async () => {
   fs.writeFileSync(path.join(repo, 'tracked.txt'), 'v0\n');
   git(['add', '-A'], repo);
 
-  /** @type {any[]} */
-  const log = [];
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append() {
-      throw new Error('the move harness never appends to the log');
-    },
-  };
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'throw', message: 'the move harness never appends to the log' });
   const workingDirectory = { get: () => cwd };
   let cwd = repo;
   const { ctx, handlers, commands, warnings } = makeContext({
@@ -1195,34 +1185,11 @@ await harness('the same-repository move harness', sameRepoMoveOnce, (moved) => {
 // 会话空闲，对话回退就会追加表层替换，而真实请求还在跑 —— 那正是
 // `revertConversation` 的 `busy` 守卫要避免的竞争。
 const staleEndOnce = async () => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-revert-stale-end-'));
   const sessionId = 'session-stale-end';
-  git(['init', '-q'], repo);
+  const repo = seedRepo({ prefix: 'dsh-revert-stale-end-', seed: { 'f.txt': 'v0\n' } });
   const file = path.join(repo, 'f.txt');
-  fs.writeFileSync(file, 'v0\n');
-  git(['add', '-A'], repo);
 
-  /** @type {any[]} */
-  const log = [];
-  /** @type {any[]} */
-  const appended = [];
-  const push = (event) => {
-    log[event.seq] = event;
-    return event;
-  };
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append(type, data, opts) {
-      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
-      push(event);
-      appended.push(event);
-      return event;
-    },
-  };
+  const { session, log, appended, push } = fakeSession({ sessionId, cwd: repo });
   const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
   apply(ctx);
   const emit = (event) => {
@@ -1296,18 +1263,7 @@ const renameOnce = async () => {
   fs.writeFileSync(original, originalBytes);
   git(['add', '-A'], repo);
 
-  /** @type {any[]} */
-  const log = [];
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append() {
-      throw new Error('a file revert never touches the conversation');
-    },
-  };
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'throw', message: 'a file revert never touches the conversation' });
   const SEQ = 7;
   const summary = { turn: 1, cwd: repo, files: [{ path: 'alpha_renamed.ts', display: 'alpha_renamed.ts' }] };
   const { ctx, handlers, commands, warnings } = makeContext({
@@ -1378,21 +1334,9 @@ const undoOnce = async () => {
   fs.writeFileSync(file, 'v0\n');
   git(['add', '-A'], repo);
 
-  /** @type {any[]} */
-  const log = [];
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'plain' });
+  // 这些夹具自己排事件序号。
   let seq = 0;
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (at) => log[at],
-    snapshotEvents: () => log,
-    append(type, data, opts) {
-      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
-      log.push(event);
-      return event;
-    },
-  };
   const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
   apply(ctx);
   const asAgent = (rawInput) =>
@@ -1511,18 +1455,7 @@ const globNameOnce = async () => {
   git(['add', '-A'], repo);
   git(['commit', '-qm', 'init'], repo);
 
-  /** @type {any[]} */
-  const log = [];
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (seq) => log[seq],
-    snapshotEvents: () => log,
-    append() {
-      throw new Error('a single-file revert never touches the conversation');
-    },
-  };
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'throw', message: 'a single-file revert never touches the conversation' });
   const SEQ = 5;
   const summary = {
     turn: 1,
@@ -1599,21 +1532,9 @@ const dottedIdOnce = async () => {
   git(['add', '-A'], repo);
   git(['commit', '-qm', 'init'], repo);
 
-  /** @type {any[]} */
-  const log = [];
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'plain' });
+  // 这些夹具自己排事件序号。
   let seq = 0;
-  const session = {
-    id: sessionId,
-    header: { cwd: repo },
-    surface: { nodes: [] },
-    eventAt: (at) => log[at],
-    snapshotEvents: () => log,
-    append(type, data, opts) {
-      const event = { type, seq: log.length, time: Date.now(), data, ...(opts ?? {}) };
-      log.push(event);
-      return event;
-    },
-  };
   const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
   apply(ctx);
   const asAgent = (rawInput) =>
@@ -1638,6 +1559,446 @@ await harness('the dotted-id harness', dottedIdOnce, (dotted) => {
   check('a Session id with dots still gets a snapshot', dotted.warnings.length === 0, JSON.stringify(dotted.warnings));
   check('a Session id with dots still reverts', dotted.after === 'v0\n', JSON.stringify(dotted.after));
   check('the dotted-id revert reports success', dotted.reverted?.kind === 'success', JSON.stringify(dotted.reverted));
+});
+
+// --- 残留索引锁 --------------------------------------------------
+// `git` 在持有 `<私有索引>.lock` 时被超时杀掉，锁文件就留在 Git
+// 目录里。之后每一次 `add`/`read-tree` 都以 128 失败，于是那个会话
+// 的快照与单文件回退一路坏到进程退出，用户只看到一条警告。私有索引
+// 只有本插件用，所以撞上它就该清掉重试 —— 但只清自己的，绝不动用户
+// 真实索引的那把锁。
+const staleLockOnce = async () => {
+  const sessionId = 'session-lock-test';
+  const repo = seedRepo({ prefix: 'dsh-revert-lock-', seed: { 'f.txt': 'v0\n' } });
+  git(['commit', '-qm', 'init'], repo);
+
+  const privateIndex = path.join(repo, '.git', `dsh-revert-files.index.${refPart(sessionId)}`);
+  fs.writeFileSync(`${privateIndex}.lock`, '');
+
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'throw', message: 'the lock harness has no conversation' });
+  const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
+  apply(ctx);
+  let seq = 0;
+  const emit = (event) => {
+    log.push(event);
+    handlers.get('session/event')(session, event);
+  };
+
+  emit({ type: 'turn/start', seq: (seq += 1), time: 0, data: { turn: 1 } });
+  await waitForTurnRef(repo, 1, warnings);
+  const lockLeftBehind = fs.existsSync(`${privateIndex}.lock`);
+
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'v1\n');
+  emit({ type: 'turn/end', seq: (seq += 1), time: 0, data: { turn: 1, reason: { kind: 'completed' } } });
+  const plan = await commands
+    .find((definition) => definition.name === COMMAND)
+    ?.handler({ agent: { id: sessionId }, rawInput: '--turn 1 --plan' });
+
+  fs.rmSync(repo, { recursive: true, force: true });
+  return { warnings, lockLeftBehind, plan };
+};
+
+await harness('the stale-index-lock harness', staleLockOnce, (lock) => {
+  check('a stale private index lock does not stop the snapshot', lock.warnings.length === 0, JSON.stringify(lock.warnings));
+  check('the stale lock is cleared', lock.lockLeftBehind === false, 'the lock file survived');
+  check('the plan still reads the snapshot', lock.plan?.kind === 'success', JSON.stringify(lock.plan));
+  check(
+    'the plan does not double up the turn number',
+    !String(lock.plan?.text ?? '').includes('第 第'),
+    String(lock.plan?.text),
+  );
+});
+
+// --- 被忽略文件的连带删除 ----------------------------------------
+// README 与工具说明承诺"Git 忽略的路径在恢复时不会被删除"。通常情形
+// 下成立，但当被跟踪的**文件**在这一轮被换成同名**目录**（构建产物的
+// 典型形态），恢复要把它写回成文件就得先清掉目录，目录里被忽略的内容
+// 一起没了 —— 那些字节不在快照里，无处可恢复。这类代价必须在确认卡片
+// 上出现，而不是回退完才让用户发现。
+const ignoredCasualtyOnce = async () => {
+  const sessionId = 'session-ignored-casualty';
+  const repo = seedRepo({ prefix: 'dsh-revert-ignored-', seed: { '.gitignore': 'dist/\n', dist: 'tracked-file\n' } });
+  git(['commit', '-qm', 'init'], repo);
+
+  const { session, log } = fakeSession({
+    sessionId,
+    cwd: repo,
+    mode: 'throw',
+    message: 'the ignored-casualty harness has no conversation',
+  });
+  const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
+  apply(ctx);
+  let seq = 0;
+  const emit = (event) => {
+    log.push(event);
+    handlers.get('session/event')(session, event);
+  };
+  const revert = (rawInput) =>
+    commands.find((definition) => definition.name === COMMAND)?.handler({ agent: { id: sessionId }, rawInput });
+
+  emit({ type: 'turn/start', seq: (seq += 1), time: 0, data: { turn: 1 } });
+  await waitForTurnRef(repo, 1, warnings);
+  // 该轮把被跟踪的文件 dist 换成目录，里面放被忽略的构建产物。
+  fs.rmSync(path.join(repo, 'dist'));
+  fs.mkdirSync(path.join(repo, 'dist'));
+  fs.writeFileSync(path.join(repo, 'dist', 'bundle.js'), 'PRECIOUS-BUILD\n');
+  emit({ type: 'turn/end', seq: (seq += 1), time: 0, data: { turn: 1, reason: { kind: 'completed' } } });
+
+  const plan = await revert('--turn 1 --plan');
+  const applied = await revert('--turn 1');
+  const distIsFile = fs.existsSync(path.join(repo, 'dist')) && fs.statSync(path.join(repo, 'dist')).isFile();
+  const buildSurvived = fs.existsSync(path.join(repo, 'dist', 'bundle.js'));
+
+  fs.rmSync(repo, { recursive: true, force: true });
+  return { plan, applied, distIsFile, buildSurvived };
+};
+
+await harness('the ignored-casualty harness', ignoredCasualtyOnce, (casualty) => {
+  check('the tracked file is restored over the directory', casualty.distIsFile === true, 'dist is not a file');
+  check(
+    'the ignored build output inside it is gone',
+    casualty.buildSurvived === false,
+    'the ignored file survived, so this case no longer describes a casualty',
+  );
+  check(
+    'the plan names the ignored file it will delete',
+    String(casualty.plan?.text ?? '').includes('dist/bundle.js'),
+    String(casualty.plan?.text),
+  );
+  check(
+    'the plan says those bytes cannot be recovered',
+    String(casualty.plan?.text ?? '').includes('无法恢复'),
+    String(casualty.plan?.text),
+  );
+  check(
+    'the applied report names it too',
+    String(casualty.applied?.text ?? '').includes('dist/bundle.js'),
+    String(casualty.applied?.text),
+  );
+});
+
+// --- 稀疏检出 ----------------------------------------------------
+// 稀疏检出下 `git add -A` 只看得到 cone 内的路径，所以快照只是工作区
+// 的一个子集。报告不能替这份不完整的快照作保说"已恢复到该轮开始前"；
+// 而 cone 外路径一有改动，`git add -A` 直接以 128 失败 —— 那种情况要给
+// 一条能照着做的说明，而不是 Git 的原文。
+const sparseOnce = async () => {
+  const sessionId = 'session-sparse';
+  const repo = seedRepo({
+    prefix: 'dsh-revert-sparse-',
+    seed: { 'a/one.txt': 'one\n', 'b/two.txt': 'two\n' },
+  });
+  git(['commit', '-qm', 'init'], repo);
+  git(['sparse-checkout', 'set', 'a'], repo);
+
+  const { session, log } = fakeSession({ sessionId, cwd: repo, mode: 'throw', message: 'the sparse harness has no conversation' });
+  const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
+  apply(ctx);
+  let seq = 0;
+  const emit = (event) => {
+    log.push(event);
+    handlers.get('session/event')(session, event);
+  };
+  const revert = (rawInput) =>
+    commands.find((definition) => definition.name === COMMAND)?.handler({ agent: { id: sessionId }, rawInput });
+
+  // (a) 只改 cone 内：能回退，但报告要说明范围。
+  emit({ type: 'turn/start', seq: (seq += 1), time: 0, data: { turn: 1 } });
+  await waitForTurnRef(repo, 1, warnings);
+  fs.writeFileSync(path.join(repo, 'a', 'one.txt'), 'one-changed\n');
+  emit({ type: 'turn/end', seq: (seq += 1), time: 0, data: { turn: 1, reason: { kind: 'completed' } } });
+  const plan = await revert('--turn 1 --plan');
+  const applied = await revert('--turn 1');
+
+  fs.rmSync(repo, { recursive: true, force: true });
+  return { warnings, plan, applied };
+};
+
+// cone 外路径有改动：第 2 轮的快照建立不起来，回退要给出可读说明。
+const sparseDirtyOnce = async () => {
+  const sessionId = 'session-sparse-dirty';
+  const repo = seedRepo({
+    prefix: 'dsh-revert-sparse-dirty-',
+    seed: { 'a/one.txt': 'one\n', 'b/two.txt': 'two\n' },
+  });
+  git(['commit', '-qm', 'init'], repo);
+  git(['sparse-checkout', 'set', 'a'], repo);
+
+  const { session, log } = fakeSession({
+    sessionId,
+    cwd: repo,
+    mode: 'throw',
+    message: 'the sparse-dirty harness has no conversation',
+  });
+  const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
+  apply(ctx);
+  let seq = 0;
+  const emit = (event) => {
+    log.push(event);
+    handlers.get('session/event')(session, event);
+  };
+
+  emit({ type: 'turn/start', seq: (seq += 1), time: 0, data: { turn: 1 } });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  // cone 外的路径被改动：Git 拒绝把它写进索引。
+  fs.mkdirSync(path.join(repo, 'b'), { recursive: true });
+  fs.appendFileSync(path.join(repo, 'b', 'two.txt'), 'dirty\n');
+  emit({ type: 'turn/end', seq: (seq += 1), time: 0, data: { turn: 1, reason: { kind: 'completed' } } });
+
+  const plan = await commands
+    .find((definition) => definition.name === COMMAND)
+    ?.handler({ agent: { id: sessionId }, rawInput: '--turn 1 --plan' });
+
+  fs.rmSync(repo, { recursive: true, force: true });
+  return { warnings, plan };
+};
+
+await harness('the sparse-checkout harness', sparseOnce, (sparse) => {
+  check('a sparse checkout still reverts the in-cone file', sparse.applied?.kind === 'success', JSON.stringify(sparse.applied));
+  check(
+    'the plan discloses the sparse scope',
+    String(sparse.plan?.text ?? '').includes('稀疏检出'),
+    String(sparse.plan?.text),
+  );
+  check(
+    'the applied report discloses the sparse scope too',
+    String(sparse.applied?.text ?? '').includes('稀疏检出'),
+    String(sparse.applied?.text),
+  );
+});
+
+await harness('the sparse-dirty harness', sparseDirtyOnce, (dirty) => {
+  check('the dirty out-of-cone path makes the plan fail', dirty.plan?.kind === 'error', JSON.stringify(dirty.plan));
+  check(
+    'the failure explains the sparse checkout instead of quoting git',
+    String(dirty.plan?.text ?? '').includes('稀疏检出') && !String(dirty.plan?.text ?? '').includes('GIT_add_FAILED'),
+    String(dirty.plan?.text),
+  );
+  check(
+    'the failure names a way forward',
+    String(dirty.plan?.text ?? '').includes('sparse-checkout 范围'),
+    String(dirty.plan?.text),
+  );
+});
+
+// --- 继承来的敌意环境变量 ----------------------------------------------
+// DSH 的子进程基座只过滤敏感名与 `DSH_*`，其余环境变量原样继承。于是
+// 一个被外部设置的 Git 变量就能改变插件的行为，其中最严重的三种：
+//   (a) `GIT_CONFIG_GLOBAL` 指向的文件里放一个 `filter.*.smudge`，
+//       `checkout-index`/`read-tree -u` 就会执行任意命令；
+//   (b) 继承的 `GIT_GLOB_PATHSPECS` 与插件显式设置的
+//       `GIT_LITERAL_PATHSPECS` 同时存在时，`ls-files` 直接 fatal 失败，
+//       单文件回退从此不可用；
+//   (c) `GIT_DIR` 会把快照与恢复引到另一个仓库上去。
+// 插件必须清掉这些变量，之后三种攻击都不成立。
+const hostileEnvOnce = async () => {
+  const sessionId = 'session-hostile-env';
+  const repo = seedRepo({
+    prefix: 'dsh-revert-hostile-',
+    seed: { 'f.txt': 'ORIGINAL\n', 'dir/foo[1].txt': 'target\n', 'dir/foo1.txt': 'sibling\n' },
+  });
+  git(['commit', '-qm', 'init'], repo);
+
+  // 一个装成 filter 的"攻击载荷"配置，以及一个诱饵仓库。
+  const attackDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-revert-attack-'));
+  const evilConfig = path.join(attackDir, 'evil.gitconfig');
+  fs.writeFileSync(
+    evilConfig,
+    "[filter \"pwn\"]\n\tsmudge = sh -c 'echo PWNED-VIA-GLOBAL-CONFIG >&2; cat'\n\trequired = false\n",
+  );
+  const decoy = seedRepo({ prefix: 'dsh-revert-decoy-', seed: { 'DECOY.txt': 'decoy\n' } });
+  // 让这条路径在快照里也带 filter 属性。
+  fs.writeFileSync(path.join(repo, '.gitattributes'), 'f.txt filter=pwn\n');
+  git(['add', '-A'], repo);
+
+  const saved = {
+    GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+    GIT_GLOB_PATHSPECS: process.env.GIT_GLOB_PATHSPECS,
+    GIT_DIR: process.env.GIT_DIR,
+  };
+  process.env.GIT_CONFIG_GLOBAL = evilConfig;
+  process.env.GIT_GLOB_PATHSPECS = '1';
+  // 只在插件跑起来之后才设 GIT_DIR：否则 `git init` 自己也会被重定向。
+  const { session, log } = fakeSession({
+    sessionId,
+    cwd: repo,
+    mode: 'throw',
+    message: 'the hostile-env harness has no conversation',
+  });
+  const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
+  apply(ctx);
+  process.env.GIT_DIR = path.join(decoy, '.git');
+
+  let seq = 0;
+  const emit = (event) => {
+    log.push(event);
+    handlers.get('session/event')(session, event);
+  };
+  const revert = (rawInput) =>
+    commands.find((definition) => definition.name === COMMAND)?.handler({ agent: { id: sessionId }, rawInput });
+
+  try {
+    emit({ type: 'turn/start', seq: (seq += 1), time: 0, data: { turn: 1 } });
+    await waitForTurnRef(repo, 1, warnings);
+    fs.writeFileSync(path.join(repo, 'f.txt'), 'MUTATED\n');
+    emit({ type: 'turn/end', seq: (seq += 1), time: 0, data: { turn: 1, reason: { kind: 'completed' } } });
+
+    const plan = await revert('--turn 1 --plan');
+    const applied = await revert('--turn 1');
+    const restored = fs.readFileSync(path.join(repo, 'f.txt'), 'utf8');
+    // 单文件回退走 `ls-files` + 字面量 pathspec，是 (b) 的受害路径。
+    const filePlan = await revert('--seq 0 --index 0');
+
+    // 诱饵仓库必须一点没被碰过。
+    const decoyRefs = spawnSync(gitPath, ['for-each-ref', 'refs/dsh/revert-files'], {
+      cwd: decoy,
+      encoding: 'utf8',
+      env: GIT_PROBE_ENV,
+    }).stdout.trim();
+    const decoyUntouched = decoyRefs === '' && fs.existsSync(path.join(decoy, 'DECOY.txt'));
+
+    return { plan, applied, restored, filePlan, warnings, decoyUntouched, attackDir, decoy, repo };
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+};
+
+await harness('the hostile-env harness', hostileEnvOnce, (hostile) => {
+  check(
+    'a hostile config global does not break the snapshot',
+    hostile.warnings.length === 0,
+    JSON.stringify(hostile.warnings),
+  );
+  check('the plan still resolves under a hostile environment', hostile.plan?.kind === 'success', JSON.stringify(hostile.plan));
+  check('the revert still restores the file', hostile.restored === 'ORIGINAL\n', JSON.stringify(hostile.restored));
+  check(
+    'no smudge filter from the inherited config ran',
+    !JSON.stringify(hostile).includes('PWNED-VIA-GLOBAL-CONFIG'),
+    'the injected filter executed',
+  );
+  check(
+    'an inherited GIT_DIR does not redirect the snapshot',
+    hostile.decoyUntouched === true,
+    'the decoy repository was touched',
+  );
+  check(
+    'the single-file path still works with inherited pathspec settings',
+    hostile.filePlan?.kind !== undefined && !String(hostile.filePlan?.text ?? '').includes('incompatible'),
+    JSON.stringify(hostile.filePlan),
+  );
+  fs.rmSync(hostile.repo, { recursive: true, force: true });
+  fs.rmSync(hostile.decoy, { recursive: true, force: true });
+  fs.rmSync(hostile.attackDir, { recursive: true, force: true });
+});
+
+// --- 插件在轮次进行中被加载 --------------------------------------------
+// `state.running` 只由本进程看到的实时 `turn/start` 置位。插件若在轮次
+// 进行中加载（HMR，或 agent resume 之后才 `apply()`），它会以为会话空闲，
+// 于是表层 `busy` 守卫形同虚设，替换会写在一条活着的循环脚下。日志才是
+// 权威：最后一条 `turn/start` 之后没有配对的 `turn/end`，那一轮就还在跑。
+const midTurnLoadOnce = async () => {
+  const sessionId = 'session-mid-turn';
+  const repo = seedRepo({ prefix: 'dsh-revert-midturn-', seed: { 'f.txt': 'v0\n' } });
+  git(['commit', '-qm', 'init'], repo);
+
+  // 第 1 轮的快照在"插件还在"时就已落下。
+  git(['update-ref', `refs/dsh/revert-files/${refPart(sessionId)}/turn-1`, git(['write-tree'], repo).trim()], repo);
+
+  // 日志里已经有 turn/start，但从不通知 handlers —— 这正是"晚加载"。
+  const { session, log, appended } = fakeSession({ sessionId, cwd: repo });
+  log.push({ type: 'system/message', seq: 0, time: 0, data: { message: { role: 'system', content: [] } }, surfaceOp: 'append' });
+  log.push({ type: 'turn/start', seq: 1, time: 0, data: { turn: 1 } });
+  log.push({ type: 'user/message', seq: 2, time: 0, data: { id: 'u1', role: 'user', content: [], source: { kind: 'user' } }, surfaceOp: 'append' });
+  session.surface.nodes = [0, 2];
+
+  const { ctx, commands, warnings } = makeContext({ sessionId, session });
+  apply(ctx); // 此刻 state.running === false，但日志说还有一轮没结束。
+
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'modified-while-running\n');
+  const outcome = await commands
+    .find((definition) => definition.name === COMMAND)
+    ?.handler({ agent: { id: sessionId }, rawInput: '--turn 1' });
+  const restored = fs.readFileSync(path.join(repo, 'f.txt'), 'utf8');
+  const appendedByRevert = appended.length;
+
+  fs.rmSync(repo, { recursive: true, force: true });
+  return { outcome, restored, appendedByRevert, warnings };
+};
+
+await harness('the mid-turn-load harness', midTurnLoadOnce, (mid) => {
+  check(
+    'a turn opened before the plugin loaded still counts as running',
+    String(mid.outcome?.text ?? '').includes('会话正在运行'),
+    JSON.stringify(mid.outcome),
+  );
+  check('the conversation is left alone while it runs', mid.appendedByRevert === 0, String(mid.appendedByRevert));
+  check('the files are still restored', mid.restored === 'v0\n', JSON.stringify(mid.restored));
+  check('the mid-turn harness logged no snapshot warning', mid.warnings.length === 0, JSON.stringify(mid.warnings));
+});
+
+// --- 隐藏范围的上界 ------------------------------------------------
+// 遮蔽的是从 `turn` 到表层末尾的整段，所以上界必须是"对话推进到了哪里"，
+// 而不是"哪一轮成功落下了快照"。用后者会让中间几轮快照失败之后的回退
+// 低估范围：模型历史已不含那几轮，聊天里却还显示着 —— 与上限截断的方向
+// 正好相反。
+const hiddenRangeOnce = async () => {
+  const sessionId = 'session-hidden-range';
+  const repo = seedRepo({ prefix: 'dsh-revert-range-', seed: { 'f.txt': 'v0\n' } });
+  git(['commit', '-qm', 'init'], repo);
+
+  // 只有第 1 轮留下快照；第 2–5 轮快照都失败了。
+  git(['update-ref', `refs/dsh/revert-files/${refPart(sessionId)}/turn-1`, git(['write-tree'], repo).trim()], repo);
+
+  const { session, log, appended } = fakeSession({ sessionId, cwd: repo });
+  const surfaceSeqs = [];
+  let seq = 0;
+  const push = (event) => {
+    event.seq = seq;
+    seq += 1;
+    log.push(event);
+    return event;
+  };
+  push({ type: 'system/message', time: 0, data: { message: { role: 'system', content: [] } }, surfaceOp: 'append' });
+  for (const turn of [1, 2, 3, 4, 5]) {
+    push({ type: 'turn/start', time: 0, data: { turn } });
+    surfaceSeqs.push(push({
+      type: 'user/message',
+      time: 0,
+      data: { id: `u${turn}`, role: 'user', content: [], source: { kind: 'user' } },
+      surfaceOp: 'append',
+    }).seq);
+    push({ type: 'turn/end', time: 0, data: { turn, reason: { kind: 'completed' } } });
+  }
+  session.surface.nodes = [0, ...surfaceSeqs];
+
+  const { ctx, handlers, commands } = makeContext({ sessionId, session });
+  apply(ctx);
+  // 只让插件知道第 1 轮之后还有内容：state.turn 保持 0，靠日志推导。
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'later\n');
+  await commands
+    .find((definition) => definition.name === COMMAND)
+    ?.handler({ agent: { id: sessionId }, rawInput: '--turn 1' });
+  const checkpoint = appended.at(-1);
+
+  fs.rmSync(repo, { recursive: true, force: true });
+  return { checkpoint, handlers };
+};
+
+await harness('the hidden-range harness', hiddenRangeOnce, (range) => {
+  check('a revert still appends a checkpoint', range.checkpoint !== undefined, 'no checkpoint was appended');
+  check(
+    'the checkpoint source carries the range start',
+    range.checkpoint?.data?.source?.from === 1,
+    JSON.stringify(range.checkpoint?.data?.source),
+  );
+  check(
+    'the range reaches the last turn the conversation reached',
+    range.checkpoint?.data?.source?.to === 5,
+    `expected to === 5, got ${JSON.stringify(range.checkpoint?.data?.source)}`,
+  );
 });
 
 for (const line of results) console.log(line);

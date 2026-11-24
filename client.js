@@ -171,17 +171,18 @@ window.__ModuleLoader__.load({
     /**
      * 会话的客户端事件窗口。一个会话绑定 —— 以及它所承载的
      * 会话 —— 会暴露 `eventSource`，即出厂 Chat 自己订阅
-     * 并读取的那个快照存储。`session.events` 只是那个会重连的
-     * 远程日志流：它既不提供 `getSnapshot` 也不提供
-     * `subscribe`，所以读它只会得到空窗口，
-     * 一切由日志驱动的功能都会静默失效。保留它，
-     * 是作为在旧版客户端中该存储以那个名字暴露时的最后手段回退。
+     * 并读取的那个快照存储（`getSnapshot` / `subscribe`）。
+     *
+     * 不要再往这里加 `.events` 之类的猜测性兜底：`SessionFace` 与
+     * `MutableSessionEventSource` 都没有那个成员，读它只会得到
+     * `undefined`，于是所有由日志驱动的功能静默失效，而失效的原因
+     * 被藏在"看起来做了兼容"的分支里。
      * @param owner - 一个会话绑定或一个会话。
      * @returns 事件源；两种形态都不存在时为 undefined。
      */
     function journalOf(owner) {
       try {
-        return owner?.eventSource ?? owner?.session?.eventSource ?? owner?.events ?? owner?.session?.events;
+        return owner?.eventSource ?? owner?.session?.eventSource;
       } catch {
         return undefined;
       }
@@ -396,9 +397,10 @@ window.__ModuleLoader__.load({
     /**
      * 一个可以安全拼进命令行的会话 id。
      *
-     * 宿主按空白切分命令行，所以 id 里不能有空白；`--` 开头的值会被
-     * 当成缺失的参数。宿主生成的 id 不会长成这样，这里只是不让一个
-     * 异常的 id 悄悄改变命令的解析结果。
+     * 宿主按空白切分命令行，所以 id 里不能有空白；这个白名单同时排除了
+     * 引号、反斜杠、`$` 之类会改变切分或路径解析的字符。以 `--` 开头的
+     * id 由宿主的参数解析器把住（它拒绝把 `--` 开头的词当成参数值），
+     * 不在这一层的职责范围内 —— 这里只保证"拼进去不会变成别的东西"。
      * @param {unknown} sessionId - 会话 id。
      * @returns {string|undefined} 校验通过的 id；否则为 undefined。
      */
@@ -706,11 +708,14 @@ window.__ModuleLoader__.load({
     /**
      * 一个撤回控件的按钮。两个入口共用它，只有样式类、标题词条与
      * 状态词条前缀不同。
+     *
+     * 失败态没有具体文案时，标题退回 `failureTitleKey`；调用方不传时
+     * 就沿用 `titleKey`（轮次入口正是这种情况，两处词条本来就一样）。
      * @param props - 状态、失败文案、样式类、词条与点击回调。
      * @returns 那个按钮。
      */
     function RevertButton(props) {
-      const { state, failure, className, titleKey, failureTitleKey, labelPrefix, translate, onClick } = props;
+      const { state, failure, className, titleKey, failureTitleKey = titleKey, labelPrefix, translate, onClick } = props;
       return h(
         'button',
         {
@@ -941,7 +946,6 @@ window.__ModuleLoader__.load({
         failure,
         className: host === null ? undefined : 'dshrvact',
         titleKey: 'action.title',
-        failureTitleKey: 'action.title',
         labelPrefix: 'action',
         translate,
         onClick: run,
