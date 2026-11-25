@@ -761,6 +761,29 @@ export function apply(ctx) {
   };
 
   /**
+   * 上面那份连带删除清单，查不到时必须留痕。
+   *
+   * 这个函数的唯一职责就是"点名会被一并删除、且无法恢复的文件"，而
+   * 预览卡片正是用户唯一能看见这笔代价的地方。把它的失败吞成空数组，
+   * 等于"查不到就说没有"—— 报告会安静地少掉那段警告，读起来与"确实
+   * 没有文件会被连带删除"完全一样。函数内部已经逐项容忍单条
+   * `ls-files` 失败（`continue`），所以能走到这里的是一次真异常，
+   * 不该被当成"没有"。
+   * @param {string} sessionId - 所属会话。
+   * @param {object} repo - 已解析的仓库。
+   * @param {Array<{status: string, path: string}>} changed - 已算出的改动路径。
+   * @returns {Promise<string[]>} 连带删除清单；查询失败时为空。
+   */
+  const casualtiesFor = async (sessionId, repo, changed) => {
+    try {
+      return await ignoredCasualtiesOf(sessionId, repo, changed);
+    } catch (error) {
+      ctx.logger?.warn?.(`revert-files: ignored-file casualties could not be listed: ${errorCode(error)}`);
+      return [];
+    }
+  };
+
+  /**
    * 把当前工作区固定成一个反悔点。此时私有索引已经刷新到工作区，
    * 所以 `write-tree` 得到的就是"这次回退即将覆盖掉的状态"。
    * @param {string} sessionId - 所属会话。
@@ -802,7 +825,7 @@ export function apply(ctx) {
     // 这次调用会刷新私有索引；随后 write-tree 就得到当前工作区的树。
     const changed = await changedPaths(sessionId, repo, tree);
     // 必须在 read-tree 之前问：之后工作区就已经被改写，目录也没了。
-    const casualties = await ignoredCasualtiesOf(sessionId, repo, changed).catch(() => []);
+    const casualties = await casualtiesFor(sessionId, repo, changed);
     // 反悔点是尽力而为的：它失败绝不能挡下回退本身。
     const undo = await pinUndo(sessionId, repo).catch(() => undefined);
     const env = { GIT_INDEX_FILE: repo.index };
@@ -934,21 +957,6 @@ export function apply(ctx) {
   };
 
   /**
-   * 把对话本身滚回，而不只是文件。日志是
-   * 仅追加的，所以这里追加一次空的 `user/message` 替换，
-   * 它会遮蔽从 `turn` 开始到表层末尾的每个表层节点：
-   * 模型不再看到那一轮及其之后的任何内容，而
-   * 记录仍保留其持久来源材料。在没有打开轮次时，只有 `user/message` 可以
-   * 替换一段表层，而回退正是在这种状态下运行；
-   * 它的空内容不携带任何文本，provider 适配器会丢掉
-   * 空节点。该替换的
-   * 消息来源为浏览器半边携带被隐藏的轮次范围。
-   * @see CONVERSATION_EVENT_TYPE
-   * @param {string} sessionId - 所属会话。
-   * @param {number} turn - 要隐藏的第一个轮次。
-   * @returns {Promise<object>} 发生了什么，供报告使用。
-   */
-  /**
    * 日志里是否还有一轮没结束。
    *
    * `state.running` 只由本进程看到的实时 `turn/start` 置位，所以插件在
@@ -1010,6 +1018,21 @@ export function apply(ctx) {
     return Math.min(latest, turn + MAX_HIDDEN_TURNS - 1);
   };
 
+  /**
+   * 把对话本身滚回，而不只是文件。日志是
+   * 仅追加的，所以这里追加一次空的 `user/message` 替换，
+   * 它会遮蔽从 `turn` 开始到表层末尾的每个表层节点：
+   * 模型不再看到那一轮及其之后的任何内容，而
+   * 记录仍保留其持久来源材料。在没有打开轮次时，只有 `user/message` 可以
+   * 替换一段表层，而回退正是在这种状态下运行；
+   * 它的空内容不携带任何文本，provider 适配器会丢掉
+   * 空节点。该替换的
+   * 消息来源为浏览器半边携带被隐藏的轮次范围。
+   * @see CONVERSATION_EVENT_TYPE
+   * @param {string} sessionId - 所属会话。
+   * @param {number} turn - 要隐藏的第一个轮次。
+   * @returns {Promise<object>} 发生了什么，供报告使用。
+   */
   const revertConversation = async (sessionId, turn) => {
     const session = ctx.get('sessions')?.get(sessionId);
     if (session === undefined || typeof session.append !== 'function') return { kind: 'unavailable' };
@@ -1039,10 +1062,6 @@ export function apply(ctx) {
       startIndex = 1;
     }
     const shadowed = nodes.slice(startIndex);
-    // 浏览器半边需要最后一个被隐藏的轮次来隐藏同样的记录
-    // 行；已固定的快照轮次是对话进展到哪里的持久记录。
-    // 手动折叠可以避免拥有极多固定 ref 的会话
-    // 撑爆一次展开调用。
     // 浏览器半边需要最后一个被隐藏的轮次来隐藏同样的记录行；
     // 它取自对话实际推进到的位置，而不是"哪一轮有快照"。
     const to = await lastHiddenTurn(sessionId, session, turn);
@@ -1415,7 +1434,7 @@ export function apply(ctx) {
    * 这些文件挡在恢复目标的位置上（一个被跟踪文件要从目录变回文件），
    * 所以它们会被删掉，而且不在快照里 —— 删了就是没了。预览与执行
    * 说同一句话，用户才能在点确认之前看见代价。
-   * @param {string[]} casualties - `ignoredCasualtiesOf` 的结果。
+   * @param {string[]} casualties - `casualtiesFor` 的结果。
    * @param {'plan'|'done'} mode - 尚未发生还是已经发生。
    * @returns {string[]} 这些行；没有时为空。
    */
@@ -1465,11 +1484,14 @@ export function apply(ctx) {
         return { kind: 'error', text: `反悔点 ${request.undo} 不存在或已被清理。` };
       }
       const changed = await changedPaths(sessionId, repo, tree);
-      const casualties = await ignoredCasualtiesOf(sessionId, repo, changed).catch(() => []);
+      const casualties = await casualtiesFor(sessionId, repo, changed);
       const lines = [`反悔会把工作区恢复到反悔点 ${request.undo} 记录的状态：`];
       if (changed.length === 0) lines.push('  工作区与反悔点一致，没有需要恢复的改动。');
       else lines.push(...describeFileLines(changed, 'plan'));
       lines.push(...describeCasualties(casualties, 'plan'));
+      // 反悔点同样是"整仓 add -A"的产物，锥外路径不在其中；执行报告
+      // （`restoreReportBody`）已经披露了这一点，预览不能说完整恢复。
+      lines.push(...describeSparseScope(repo, 'plan'));
       return { kind: 'success', text: lines.join('\n') };
     }
     if (Number.isSafeInteger(request.seq) && Number.isSafeInteger(request.index)) {
@@ -1507,7 +1529,7 @@ export function apply(ctx) {
       return { kind: 'error', text: noSnapshotMessage(resolved) };
     }
     const changed = await changedPaths(sessionId, repo, tree);
-    const casualties = await ignoredCasualtiesOf(sessionId, repo, changed).catch(() => []);
+    const casualties = await casualtiesFor(sessionId, repo, changed);
     const lines = [];
     if (changed.length === 0) {
       lines.push(`${describeTurn(resolved)}没有需要恢复的文件改动。`);
@@ -1607,7 +1629,7 @@ export function apply(ctx) {
     if (result.reverted.length === 0) {
       // 一件都没恢复就不能用成功口径：那张卡片的确认按钮会带着
       // "已完成"的报告，而工作区其实没有任何变化。
-      parts.push(`没有恢复任何文件：第 ${turn} 轮的快照里取不到它们的内容。`);
+      parts.push(`没有恢复任何文件：${describeTurn(turn)}的快照里取不到它们的内容。`);
     } else {
       parts.push(`已从${describeTurn(turn)}的快照恢复 ${result.reverted.length} 个文件。`);
       for (const item of result.reverted) {

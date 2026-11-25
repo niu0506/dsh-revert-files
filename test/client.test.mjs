@@ -26,7 +26,8 @@ class El {
     this.className = '';
     this.attributes = {};
     this.textContent = '';
-    this.style = {};
+    // 没有 `style`：`client.js` 从不在任何节点上写 `.style`（隐藏靠注入
+    // 样式表，不靠内联样式），留一个空对象只会让桩看起来比契约宽。
   }
   appendChild(node) {
     node.parentElement = this;
@@ -215,7 +216,6 @@ const strictRemount = () => {
 const React = {
   createElement,
   Fragment,
-  memo: (component) => component,
   useRef: (initial) => {
     const frame = current;
     const index = frame.index++;
@@ -540,8 +540,8 @@ passNodes.find((node) => node.className === 'dshrvbtn')?.__props?.onClick?.();
 await new Promise((resolve) => setTimeout(resolve, 0));
 
 // 缺少操作条的行保留气泡上方的回退座位。
-const plain = new El('div');
-plain.setAttribute('data-chat-flow-kind', 'user');
+// （这里原本有一个 `plain` 元素的声明，从未被读取 —— 行树由
+// `PlainRow` 自己建，它的 `data-chat-flow-kind` 也在下面单独设。）
 const PlainRow = () => createElement('div', { className: 'AkCqbG_userRow' }, createElement(turnComponent, rowProps));
 tree = createElement(PlainRow);
 container.children.length = 0;
@@ -577,10 +577,12 @@ roots.push({ getAttribute: () => sessionId });
 boundSession = fakeSession;
 remount();
 check('no rules before any rollback survives', rules() === '', JSON.stringify(rules()));
-check(
-  'the journal is read from eventSource, not the remote stream',
-  remoteJournalStream.getSnapshot === undefined && fakeSession.eventSource.getSnapshot().entries === entries,
-);
+// 这里原本有一条"日志从 eventSource 读，而不是远程流"的检查，但两个
+// 合取项都是夹具自己的属性（诱饵字面量上没有 `getSnapshot`；桩的
+// `getSnapshot` 回的就是 `entries`），`client.js` 怎么改都不会让它失败。
+// 那条断言想守的东西 —— 回退成读 `events` 会让隐藏整体失效 —— 由
+// 下面这条真正的行为断言覆盖：诱饵仍在会话对象上，若客户端读了它，
+// 规则就会是空的。
 
 entries.push(rollback(2, 2));
 publish();
@@ -849,7 +851,15 @@ check(
   cardTextOf(forcedCard).includes('PLAN: evict and remove session-1?'),
   cardTextOf(forcedCard),
 );
-check('the forced card labels its control as a force delete', buttonOf() !== undefined);
+// 桩把 children 拍平成数组，所以标签文字要拼回来再比。区域设置桩
+// 原样回 key，因此断言 key 本身就是断言"走了强制删除那条词条"，
+// 而不是普通删除的 `delete.confirm`。
+const forcedLabel = [buttonOf()?.__props?.children ?? []].flat().join('');
+check(
+  'the forced card labels its control as a force delete',
+  forcedLabel === 'delete.forceConfirm',
+  forcedLabel,
+);
 buttonOf()?.__props?.onClick?.();
 await tick();
 check(
@@ -1149,9 +1159,11 @@ tree = createElement(fileActionComponent, {
 });
 mount();
 await new Promise((resolve) => setTimeout(resolve, 0));
+// `every` 在空渲染上是空真：`parseCoordinates` 返回 null 时组件什么都
+// 不渲染，`passNodes` 就是空的。先断言"确实什么都没渲染"，这条才有意义。
 check(
   'a coordinate the Host would reject offers no control',
-  passNodes.every((node) => node.className !== 'dshrvfile'),
+  passNodes.length === 0 && passNodes.every((node) => node.className !== 'dshrvfile'),
   JSON.stringify(passNodes.map((node) => node.className)),
 );
 

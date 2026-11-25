@@ -35,7 +35,6 @@ if (gitPath === '') {
   process.exit(0);
 }
 
-/** 运行一条初始化期的 Git 命令，非零退出时大声报错。 */
 /**
  * 运行一条初始化期的 Git 命令，非零退出时大声报错。
  *
@@ -784,7 +783,13 @@ check(
   gatedLatest?.kind === 'ask' && String(gatedLatest.reason).includes('最新一轮'),
   JSON.stringify(gatedLatest),
 );
-check('the gate is registered on the pre-execute slot', typeof gate === 'function');
+// `gate` 在上面已经被调用过了：没注册的话早就抛了，所以
+// `typeof gate === 'function'` 恒真。真正值得断言的是它注册在
+// **正确的槽位**上 —— 换成别的槽位就不会被工具层调用。
+check(
+  'the gate is registered on the pre-execute slot',
+  gateSeam.handlers.has('tools/pre-execute') && gateSeam.handlers.get('tools/pre-execute') === gate,
+);
 check(
   'the plan action falls through untouched',
   (await gate({ name: 'revert_files', arguments: { action: 'plan' } }, gateNextFn)) === nextDecision && gateNext === 1,
@@ -1436,7 +1441,14 @@ for (const [label, value] of Object.entries(refusedTurns)) {
     JSON.stringify(value),
   );
 }
-check('the tool still exposes list/plan/revert', typeof revertTool?.execute === 'function');
+// 标签承诺的是三个 action，所以断言它们真的在 schema 里，而不只是
+// "有个 execute"（那对任何工具都成立）。
+check(
+  'the tool still exposes list/plan/revert',
+  JSON.stringify(revertTool?.parameters?.properties?.action?.enum) === JSON.stringify(['list', 'plan', 'revert']) &&
+    typeof revertTool?.execute === 'function',
+  JSON.stringify(revertTool?.parameters?.properties?.action),
+);
 
 // --- 名字里带 glob 元字符的文件 ---------------------------------
 // `git ls-files -- <path>` 默认把路径解释成 glob：`dir/foo[1].txt` 会
@@ -1471,6 +1483,10 @@ const globNameOnce = async () => {
     services: { workspaceChanges: { summary: (id, seq) => (id === sessionId && seq === SEQ ? summary : undefined) } },
   });
   apply(ctx);
+  // 真实接缝会真的删除；默认桩什么都不做，而 `dir/bar[2].txt` 不在快照里，
+  // 走的是"从工作区删除"这条分支 —— 没有这一行，下面那句断言就只能
+  // 证明"桩什么都没删"，证明不了撤回删对了文件。
+  ctx.fs.deleteFile = async (target) => fs.rmSync(target, { force: true });
 
   const opened = { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } };
   log[0] = opened;
@@ -1514,7 +1530,7 @@ await harness('the glob-name harness', globNameOnce, (glob) => {
   check('the glob-name revert reports success', glob.applied?.kind === 'success', JSON.stringify(glob.applied));
   check('the requested file is the one restored', glob.target === 'target\n', JSON.stringify(glob.target));
   check('the sibling that shares the glob is left alone', glob.sibling === 'sibling changed\n', JSON.stringify(glob.sibling));
-  check('a sibling created after the snapshot does not swallow the target', glob.lateTarget === 'target changed\n', JSON.stringify(glob.lateTarget));
+  check('a file created after the snapshot is deleted, not written back', glob.lateTarget === '(deleted)', JSON.stringify(glob.lateTarget));
   check('the late sibling is left alone', glob.lateSibling === 'late sibling\n', JSON.stringify(glob.lateSibling));
   check('the glob-name harness logged no snapshot warning', glob.warnings.length === 0, JSON.stringify(glob.warnings));
 });
@@ -1825,7 +1841,22 @@ const hostileEnvOnce = async () => {
     mode: 'throw',
     message: 'the hostile-env harness has no conversation',
   });
-  const { ctx, handlers, commands, warnings } = makeContext({ sessionId, session });
+  // 单文件回退要经 `workspaceChanges` 解析坐标才走得到 `ls-files` ——
+  // 没有这个服务时它会提前以"找不到变更记录"失败，于是 (b) 那条
+  // 攻击路径根本没被执行过。夹具已经种下了 glob 名字的文件，这里把
+  // 坐标接上，让断言真的落在 pathspec 上。
+  const { ctx, handlers, commands, warnings } = makeContext({
+    sessionId,
+    session,
+    services: {
+      workspaceChanges: {
+        summary: (id, seqValue) =>
+          id === sessionId && seqValue === 0
+            ? { turn: 1, cwd: repo, files: [{ path: 'dir/foo[1].txt', display: 'dir/foo[1].txt' }] }
+            : undefined,
+      },
+    },
+  });
   apply(ctx);
   process.env.GIT_DIR = path.join(decoy, '.git');
 
@@ -1884,9 +1915,14 @@ await harness('the hostile-env harness', hostileEnvOnce, (hostile) => {
     hostile.decoyUntouched === true,
     'the decoy repository was touched',
   );
+  // 这一条必须断言"真的恢复了"，而不是"有个 kind" —— 夹具以前没有
+  // `workspaceChanges`，单文件回退会提前以 error 结束，于是继承了
+  // `GIT_GLOB_PATHSPECS` 的那条路径根本没被踩到，断言却照样通过。
   check(
     'the single-file path still works with inherited pathspec settings',
-    hostile.filePlan?.kind !== undefined && !String(hostile.filePlan?.text ?? '').includes('incompatible'),
+    hostile.filePlan?.kind === 'success' &&
+      String(hostile.filePlan?.text ?? '').includes('dir/foo[1].txt') &&
+      !String(hostile.filePlan?.text ?? '').includes('incompatible'),
     JSON.stringify(hostile.filePlan),
   );
   fs.rmSync(hostile.repo, { recursive: true, force: true });

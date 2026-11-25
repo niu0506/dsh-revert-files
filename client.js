@@ -169,6 +169,16 @@ window.__ModuleLoader__.load({
     const selectorValue = (value) => String(value).replace(/["\\]/g, '\\$&');
 
     /**
+     * 某个座位 props 上的区域设置绑定器。
+     *
+     * 三个座位都按 `props.t` 取词条；只有座位被独立渲染（测试里，
+     * 或上游改了契约）时才没有它，那时退回中文字典比显示裸 key 有用。
+     * @param props - 该座位的 props。
+     * @returns 取词条的函数。
+     */
+    const binderOf = (props) => (typeof props.t === 'function' ? props.t : (key) => zh[key] ?? key);
+
+    /**
      * 会话的客户端事件窗口。一个会话绑定 —— 以及它所承载的
      * 会话 —— 会暴露 `eventSource`，即出厂 Chat 自己订阅
      * 并读取的那个快照存储（`getSnapshot` / `subscribe`）。
@@ -771,13 +781,16 @@ window.__ModuleLoader__.load({
      * 不可逆的，不能在用户没看到预览的情况下执行。
      * @param sessionId - 所属会话。
      * @param line - 要执行的 `/revert` 命令行。
-     * @param refusalText - 把一次不可确认的结局翻译成一句话。
+     * @param translate - 区域设置绑定器；拒绝文案由它推导。
      * @returns 状态、计划文本、拒绝标志，以及各个回调。
      */
-    function useRevertAction(sessionId, line, refusalText) {
+    function useRevertAction(sessionId, line, translate) {
       // 预览就是同一条命令加上 `--plan`，所以它由 `line` 决定，
       // 不必让每个调用点各推一遍。
       const planLine = line === undefined ? undefined : `${line} --plan`;
+      // 两个调用点原本各写一份同样的回调；它是 `translate` 的函数，
+      // 所以在这里推一次就够。
+      const refusalText = React.useCallback((report) => translate(refusalKeyOf(report)), [translate]);
       const [state, setState] = React.useState('idle');
       const [plan, setPlan] = React.useState(undefined);
       const [refused, setRefused] = React.useState(false);
@@ -896,15 +909,14 @@ window.__ModuleLoader__.load({
      * @returns 该控件；该行的轮次未知时为 null。
      */
     function RevertTurnAction(props) {
-      const translate = typeof props.t === 'function' ? props.t : (key) => zh[key] ?? key;
+      const translate = binderOf(props);
       const source = props.source;
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined;
       const useChat = props.useChat;
       const select = React.useCallback((snapshot) => turnOfSource(snapshot, source), [source]);
       const turn = useTurnNumber(useChat, select);
       const line = Number.isSafeInteger(turn) && turn > 0 ? `/revert --turn ${turn}` : undefined;
-      const refusalText = React.useCallback((report) => translate(refusalKeyOf(report)), [translate]);
-      const { state, plan, refused, failure, run, cancel, confirm } = useRevertAction(sessionId, line, refusalText);
+      const { state, plan, refused, failure, run, cancel, confirm } = useRevertAction(sessionId, line, translate);
       const active = props.kind === 'user' && line !== undefined;
       const anchorRef = React.useRef(null);
       const [host, setHost] = React.useState(null);
@@ -1005,15 +1017,14 @@ window.__ModuleLoader__.load({
      * @returns 该控件；路由不可读时为 null。
      */
     function RevertFileAction(props) {
-      const translate = typeof props.t === 'function' ? props.t : (key) => zh[key] ?? key;
+      const translate = binderOf(props);
       const coordinates = React.useMemo(() => parseCoordinates(props.actionUrl), [props.actionUrl]);
       const line =
         coordinates === null ? undefined : `/revert --seq ${coordinates.seq} --index ${coordinates.index}`;
-      const refusalText = React.useCallback((report) => translate(refusalKeyOf(report)), [translate]);
       const { state, plan, refused, failure, run, cancel, confirm } = useRevertAction(
         coordinates?.sessionId,
         line,
-        refusalText,
+        translate,
       );
 
       if (coordinates === null) return null;
@@ -1044,6 +1055,27 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 会话列表的当前快照，解出两个调用方真正要用的部分。
+     *
+     * 列表读取在两个调用点各出现一次，而每次都得同时防住三件事：
+     * 服务缺席（插件在别的主机里被加载）、`getSnapshot` 抛错、
+     * 以及快照没带那两栏。把这三道防护收在一处，调用方就只剩读数据。
+     * @returns {{ids: any[], rows: Record<string, unknown>}} 行 id 与按 id 索引的行。
+     */
+    function sessionList() {
+      let snapshot;
+      try {
+        snapshot = sessions?.list?.getSnapshot?.();
+      } catch {
+        snapshot = undefined;
+      }
+      return {
+        ids: Array.isArray(snapshot?.ids) ? snapshot.ids : [],
+        rows: isRecord(snapshot?.byId) ? snapshot.byId : {},
+      };
+    }
+
+    /**
      * 此刻能够承载一条删除命令的会话。目标自身绝不是
      * 候选者：会话不能删除自己，而在这里打开它反而会
      * 把它实体化 —— 那正是宿主拒绝移除的状态。
@@ -1061,14 +1093,7 @@ window.__ModuleLoader__.load({
      * @returns 承载会话的 id；没有任何可达会话时为 undefined。
      */
     function carrierFor(targetId) {
-      let snapshot;
-      try {
-        snapshot = sessions?.list?.getSnapshot?.();
-      } catch {
-        snapshot = undefined;
-      }
-      const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
-      const rows = isRecord(snapshot?.byId) ? snapshot.byId : {};
+      const { ids, rows } = sessionList();
       /** 这一行究竟能不能承载命令：子 Agent 行与空白新会话行都不行。 */
       const usable = (id) => {
         const row = isRecord(rows[id]) ? rows[id] : {};
@@ -1108,13 +1133,7 @@ window.__ModuleLoader__.load({
      * @returns 还有其它行时为 true。
      */
     function hasOtherRows(targetId) {
-      try {
-        const snapshot = sessions?.list?.getSnapshot?.();
-        const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
-        return ids.some((id) => typeof id === 'string' && id !== targetId);
-      } catch {
-        return false;
-      }
+      return sessionList().ids.some((id) => typeof id === 'string' && id !== targetId);
     }
 
     /** 唯一一个等待用户确认的删除请求（如果有）。 */
@@ -1167,7 +1186,7 @@ window.__ModuleLoader__.load({
      * @returns 打开的卡片；没有待处理项时为 null。
      */
     function DeleteSessionDialog(props) {
-      const translate = typeof props.t === 'function' ? props.t : (key) => zh[key] ?? key;
+      const translate = binderOf(props);
       const request = useDeleteRequest();
       const [phase, setPhase] = React.useState('idle');
       const [body, setBody] = React.useState(undefined);
